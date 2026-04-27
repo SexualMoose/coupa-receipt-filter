@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Coupa Receipt Filter (Attach Receipt dialog, ±% across currencies)
 // @namespace    local.tylerkeller
-// @version      0.5.1
+// @version      0.5.2
 // @description  Filter the Coupa "Attach a receipt" dialog by ±X%, plus a top-right panel with Apply-Account-to-All, Download-Problems (xlsx with red/yellow row highlights AND conditional formatting on invalid entries), and Upload-and-Apply (description + attendee bulk edit with first-line confirmation + progress bar).
 // @match        https://*.coupahost.com/*
 // @run-at       document-idle
@@ -32,14 +32,47 @@
   const NEW_ATTENDEE_TYPE_ID = 6;   // "BDP Employee (manual entry)"
 
   let excelJsPromise = null;
+  function getExcelJS() {
+    return (typeof window !== 'undefined' && window.ExcelJS)
+        || (typeof self !== 'undefined' && self.ExcelJS)
+        || (typeof globalThis !== 'undefined' && globalThis.ExcelJS)
+        || (typeof unsafeWindow !== 'undefined' && unsafeWindow.ExcelJS);
+  }
   function loadExcelJS() {
-    if (window.ExcelJS) return Promise.resolve(window.ExcelJS);
+    const existing = getExcelJS();
+    if (existing) return Promise.resolve(existing);
     if (!excelJsPromise) {
-      excelJsPromise = fetch(EXCELJS_URL).then(r => r.text()).then(code => {
-        // eval into global scope so window.ExcelJS gets defined
-        (0, eval)(code);
-        return window.ExcelJS;
-      });
+      excelJsPromise = (async () => {
+        const r = await fetch(EXCELJS_URL);
+        const code = await r.text();
+        // Wrap so the UMD wrapper finds a usable global, and capture the result.
+        try {
+          const fn = new Function(code + '\n; return (typeof ExcelJS !== "undefined") ? ExcelJS : (typeof self !== "undefined" && self.ExcelJS);');
+          const result = fn();
+          if (result) {
+            try { window.ExcelJS = result; } catch {}
+            try { self.ExcelJS = result; } catch {}
+          }
+        } catch (e) {
+          // Fall through to alternative load
+        }
+        let resolved = getExcelJS();
+        if (resolved) return resolved;
+        // Fallback: blob-script tag (works when CSP allows blob:)
+        const blob = new Blob([code], { type: 'application/javascript' });
+        const url = URL.createObjectURL(blob);
+        await new Promise((resolve, reject) => {
+          const s = document.createElement('script');
+          s.src = url;
+          s.onload = resolve;
+          s.onerror = () => reject(new Error('ExcelJS blob-script load failed (CSP?)'));
+          document.head.appendChild(s);
+        });
+        URL.revokeObjectURL(url);
+        resolved = getExcelJS();
+        if (!resolved) throw new Error('ExcelJS loaded but global not set; check Tampermonkey sandbox.');
+        return resolved;
+      })();
     }
     return excelJsPromise;
   }
@@ -497,11 +530,26 @@
 
   async function buildProblemsWorkbook(panel) {
     const status = panel.querySelector('.__rf_acct_status');
-    status.textContent = 'Loading ExcelJS…';
-    const ExcelJS = await loadExcelJS();
-    status.textContent = 'Fetching reports…';
-    const [reports, usdRates] = await Promise.all([fetchAllDraftReports(), fetchFxToUSD()]);
-    status.textContent = 'Analyzing lines…';
+    let stage = 'init';
+    try {
+      stage = 'load ExcelJS';
+      status.textContent = 'Loading ExcelJS…';
+      const ExcelJS = await loadExcelJS();
+      if (!ExcelJS || !ExcelJS.Workbook) throw new Error('ExcelJS not available after load');
+      stage = 'fetch reports';
+      status.textContent = 'Fetching reports…';
+      const [reports, usdRates] = await Promise.all([fetchAllDraftReports(), fetchFxToUSD()]);
+      stage = 'analyze lines';
+      status.textContent = 'Analyzing lines…';
+      return await _buildWorkbookInner(ExcelJS, reports, usdRates, status, panel);
+    } catch (e) {
+      const msg = (e && e.message) ? e.message : String(e);
+      console.error('[CoupaReceiptFilter] buildProblemsWorkbook failed at stage', stage, e);
+      throw new Error(`download failed at "${stage}": ${msg}`);
+    }
+  }
+
+  async function _buildWorkbookInner(ExcelJS, reports, usdRates, status, panel) {
 
     const attendees = collectAttendeeDirectory(reports);
     const RED = 'FFFFC7CE';      // light red
@@ -557,28 +605,32 @@
     });
 
     // Conditional formatting on Lines: red-fill any cell in attendee columns that
-    // is non-empty AND not "x"/"X". Range covers all attendee columns and ample rows.
-    const colLetter = (n) => {
-      let s = '';
-      while (n > 0) { const r = (n - 1) % 26; s = String.fromCharCode(65 + r) + s; n = Math.floor((n - 1) / 26); }
-      return s;
-    };
-    const attCol1Letter = colLetter(13);
-    const attColLastLetter = colLetter(headers.length);
-    const refRange = `${attCol1Letter}2:${attColLastLetter}10000`;
-    sh.addConditionalFormatting({
-      ref: refRange,
-      rules: [{
-        type: 'expression',
-        priority: 1,
-        formulae: [`AND(LEN(${attCol1Letter}2)>0, UPPER(${attCol1Letter}2)<>"X")`],
-        style: {
-          fill: { type: 'pattern', pattern: 'solid', bgColor: { argb: 'FFFF6B6B' } },
-          font: { color: { argb: 'FFFFFFFF' }, bold: true },
-        },
-      }],
-    });
-    // Conditional formatting on new_description column (col K, idx 11): nothing to validate; left clean.
+    // is non-empty AND not "x"/"X". Wrapped in try/catch so a CF API mismatch doesn't
+    // sink the whole download.
+    try {
+      const colLetter = (n) => {
+        let s = '';
+        while (n > 0) { const r = (n - 1) % 26; s = String.fromCharCode(65 + r) + s; n = Math.floor((n - 1) / 26); }
+        return s;
+      };
+      if (headers.length >= 13) {
+        const attCol1Letter = colLetter(13);
+        const attColLastLetter = colLetter(headers.length);
+        const refRange = `${attCol1Letter}2:${attColLastLetter}10000`;
+        sh.addConditionalFormatting({
+          ref: refRange,
+          rules: [{
+            type: 'expression',
+            priority: 1,
+            formulae: [`AND(LEN(${attCol1Letter}2)>0, UPPER(${attCol1Letter}2)<>"X")`],
+            style: {
+              fill: { type: 'pattern', pattern: 'solid', bgColor: { argb: 'FFFF6B6B' } },
+              font: { color: { argb: 'FFFFFFFF' }, bold: true },
+            },
+          }],
+        });
+      }
+    } catch (e) { console.warn('[CoupaReceiptFilter] Lines conditional formatting skipped:', e); }
 
     // Attendees sheet
     const ash = wb.addWorksheet('Attendees');
@@ -591,34 +643,33 @@
     noteRow.getCell(1).value = 'To add a NEW attendee: append a row with id BLANK, leave type_id blank (defaults to 6), set first_name and last_name. Use "first last" as a column header on the Lines sheet to mark X.';
     noteRow.getCell(1).font = { italic: true, color: { argb: 'FF888888' } };
 
-    // Conditional formatting on Attendees:
-    // - id column (A): red if non-empty AND not numeric
-    // - type_id column (B): red if non-empty AND not 5 or 6
-    // - first_name (C) / last_name (D): red if both blank when id is blank (i.e., empty new row not allowed without name)
-    ash.addConditionalFormatting({
-      ref: 'A2:A10000',
-      rules: [{
-        type: 'expression',
-        priority: 1,
-        formulae: ['AND(LEN(A2)>0, NOT(ISNUMBER(A2)))'],
-        style: {
-          fill: { type: 'pattern', pattern: 'solid', bgColor: { argb: 'FFFF6B6B' } },
-          font: { color: { argb: 'FFFFFFFF' }, bold: true },
-        },
-      }],
-    });
-    ash.addConditionalFormatting({
-      ref: 'B2:B10000',
-      rules: [{
-        type: 'expression',
-        priority: 1,
-        formulae: ['AND(LEN(B2)>0, NOT(OR(B2=5, B2=6)))'],
-        style: {
-          fill: { type: 'pattern', pattern: 'solid', bgColor: { argb: 'FFFF6B6B' } },
-          font: { color: { argb: 'FFFFFFFF' }, bold: true },
-        },
-      }],
-    });
+    // Conditional formatting on Attendees (wrapped so failures don't sink download).
+    try {
+      ash.addConditionalFormatting({
+        ref: 'A2:A10000',
+        rules: [{
+          type: 'expression',
+          priority: 1,
+          formulae: ['AND(LEN(A2)>0, NOT(ISNUMBER(A2)))'],
+          style: {
+            fill: { type: 'pattern', pattern: 'solid', bgColor: { argb: 'FFFF6B6B' } },
+            font: { color: { argb: 'FFFFFFFF' }, bold: true },
+          },
+        }],
+      });
+      ash.addConditionalFormatting({
+        ref: 'B2:B10000',
+        rules: [{
+          type: 'expression',
+          priority: 1,
+          formulae: ['AND(LEN(B2)>0, NOT(OR(B2=5, B2=6)))'],
+          style: {
+            fill: { type: 'pattern', pattern: 'solid', bgColor: { argb: 'FFFF6B6B' } },
+            font: { color: { argb: 'FFFFFFFF' }, bold: true },
+          },
+        }],
+      });
+    } catch (e) { console.warn('[CoupaReceiptFilter] Attendees conditional formatting skipped:', e); }
 
     status.textContent = `Building xlsx (${problemRows} problem rows)…`;
     const buf = await wb.xlsx.writeBuffer();
