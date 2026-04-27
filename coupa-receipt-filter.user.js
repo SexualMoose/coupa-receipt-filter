@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Coupa Receipt Filter (Attach Receipt dialog, ±% across currencies)
 // @namespace    local.tylerkeller
-// @version      0.6.4
+// @version      0.7.1
 // @description  Filter the Coupa "Attach a receipt" dialog by ±X%, plus a top-right panel with Apply-Account-to-All, Download-Problems (xlsx with red/yellow row highlights AND conditional formatting on invalid entries), and Upload-and-Apply (description + attendee bulk edit with first-line confirmation + progress bar).
 // @match        https://*.coupahost.com/*
 // @run-at       document-idle
@@ -528,7 +528,8 @@
     return list;
   }
 
-  async function buildProblemsWorkbook(panel) {
+  async function buildProblemsWorkbook(panel, opts) {
+    const onlyProblems = !opts || opts.onlyProblems !== false;
     const status = panel.querySelector('.__rf_acct_status');
     let stage = 'init';
     try {
@@ -541,7 +542,7 @@
       const [reports, usdRates] = await Promise.all([fetchAllDraftReports(), fetchFxToUSD()]);
       stage = 'analyze lines';
       status.textContent = 'Analyzing lines…';
-      return await _buildWorkbookInner(ExcelJS, reports, usdRates, status, panel);
+      return await _buildWorkbookInner(ExcelJS, reports, usdRates, status, panel, onlyProblems);
     } catch (e) {
       const msg = (e && e.message) ? e.message : String(e);
       console.error('[CoupaReceiptFilter] buildProblemsWorkbook failed at stage', stage, e);
@@ -562,7 +563,7 @@
       .sort((a, b) => a.name.localeCompare(b.name));
   }
 
-  async function _buildWorkbookInner(ExcelJS, reports, usdRates, status, panel) {
+  async function _buildWorkbookInner(ExcelJS, reports, usdRates, status, panel, onlyProblems) {
 
     const attendees = collectAttendeeDirectory(reports);
     const usedCategories = collectUsedCategories(reports);
@@ -609,7 +610,7 @@
     reports.forEach(rpt => {
       (rpt.expense_lines || []).forEach(l => {
         const { problems, usdEq, isGiftMeal, attendees: lineAttendees, perAttendee } = lineProblems(l, usdRates);
-        if (!problems.length) return;
+        if (onlyProblems && !problems.length) return;
         problemRows++;
         const attIds = new Set(lineAttendees.map(a => a.id));
         const currentAttendees = lineAttendees.map(a => `${a.first_name} ${a.last_name}`).join('; ');
@@ -1122,6 +1123,263 @@
     return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   }
 
+  // ---------- receipt auto-match ----------
+  const MATCH_TOL_SAME_CCY = 0.01;
+  const MATCH_TOL_CROSS_CCY = 0.12; // FX spread on corp cards is often 8-12%
+  const STOP_WORDS = new Set([
+    'the','of','and','llc','ltd','inc','co','corp','sa','sas','bv','gmbh','ag','sl','spa','srl',
+    'merchant','copy','customer','receipt','cia','de','la','el','los','las','del','d',
+    'mc','mcd','mcdo','mcdonald','mcdonalds','com','www','io','tm','to','at','for','in','on',
+    'a','an','as','is','it','no','or','by','be','re','via',
+    'order','transaction','transactie','transact','recibo','tienda','bar','cafe','restaurant','restaurante','pizza','pizzeria','food','foods','grill','steakhouse','sushi','kitchen',
+    'paris','amsterdam','antwerpen','antwerp','london','madrid','miami','dallas','philadelphia','cartagena','bocagrande','luxembourg','luxenbourg','luxenburgo','watermael',
+    'mastercard','visa','card','controle','controlegegevens','airlines','airline','airport','flight','flights',
+    'meal','breakfast','lunch','dinner','snack','drink',
+  ]);
+  function _tokens(s) {
+    if (!s) return new Set();
+    return new Set(String(s).toLowerCase().replace(/[^a-z0-9 ]+/g, ' ').split(/\s+/).filter(t => t.length >= 3 && !/^\d+$/.test(t) && !STOP_WORDS.has(t)));
+  }
+  function _overlap(a, b) {
+    let n = 0;
+    for (const t of a) if (b.has(t)) n++;
+    return n;
+  }
+
+  function readWalletReceipts() {
+    return Array.from(document.querySelectorAll('li.walletLine')).map(li => {
+      const img = li.querySelector('img.s-walletReceiptImg');
+      const m = img?.src?.match(/expense_lines\/(\d+)\/expense_artifacts\/(\d+)/);
+      if (!m) return null;
+      const merchant = (li.querySelector('.s-receiptDescription')?.textContent || '').trim();
+      const filename = img.alt || '';
+      const amountText = (li.querySelector('.s-receiptAmount')?.textContent || '').trim();
+      const currency = (li.querySelector('.currency_code')?.textContent || '').trim().toUpperCase();
+      const amount = parseAmt(amountText);
+      if (!isFinite(amount) || !currency) return null;
+      return {
+        artifact_id: m[2],
+        wallet_line_id: m[1],
+        merchant, filename, amount, currency,
+        _tokens: new Set([..._tokens(merchant), ..._tokens(filename)]),
+      };
+    }).filter(Boolean);
+  }
+
+  function buildMatches(reports, receipts, usdRates) {
+    const usdRate = c => c === 'USD' ? 1 : (usdRates[c] || null);
+    const used = new Set();
+    const matches = [];
+    const lines = [];
+    reports.forEach(r => (r.expense_lines || []).forEach(l => {
+      if ((l.expense_artifacts || []).length) return; // already has receipt
+      const amt = parseAmt(l.receipt_amount);
+      const cur = (l.receipt_currency?.code || '').toUpperCase();
+      if (!isFinite(amt) || !cur) return;
+      lines.push({
+        line_id: l.id,
+        report_id: r.id,
+        merchant: l.merchant || '',
+        amount: amt,
+        currency: cur,
+        date: l.local_expense_date,
+        _tokens: _tokens(l.merchant),
+      });
+    }));
+    // Largest first reduces ambiguity
+    lines.sort((a, b) => {
+      const aUsd = usdRate(a.currency) ? a.amount / usdRate(a.currency) : a.amount;
+      const bUsd = usdRate(b.currency) ? b.amount / usdRate(b.currency) : b.amount;
+      return bUsd - aUsd;
+    });
+
+    for (const line of lines) {
+      let best = null, bestScore = -Infinity;
+      for (const r of receipts) {
+        if (used.has(r.artifact_id)) continue;
+        let score = -Infinity;
+        let tier = null;
+        const sameCcy = r.currency === line.currency;
+        const overlap = _overlap(line._tokens, r._tokens);
+        if (sameCcy) {
+          // Tier A: exact amount → very high
+          if (Math.abs(r.amount - line.amount) < 0.01) {
+            score = 1000 + overlap * 5;
+            tier = 'exact';
+          } else if (Math.abs(r.amount - line.amount) <= line.amount * MATCH_TOL_SAME_CCY) {
+            // Tier B: same currency, ±1%, must have ≥1 token overlap
+            if (overlap >= 1) {
+              score = 500 + overlap * 10 - Math.abs(r.amount - line.amount);
+              tier = 'close_same_ccy';
+            }
+          }
+        } else {
+          // Tier C: cross-currency, FX-window with token overlap required
+          const lUsd = usdRate(line.currency) ? line.amount / usdRate(line.currency) : null;
+          const rUsd = usdRate(r.currency) ? r.amount / usdRate(r.currency) : null;
+          if (lUsd && rUsd) {
+            const diffPct = Math.abs(lUsd - rUsd) / Math.max(lUsd, 1);
+            if (diffPct <= MATCH_TOL_CROSS_CCY && overlap >= 1) {
+              score = 100 + overlap * 20 - diffPct * 100;
+              tier = 'cross_ccy';
+            }
+          }
+        }
+        if (score > bestScore) { bestScore = score; best = r ? { receipt: r, tier, overlap } : null; }
+      }
+      if (best && bestScore > -Infinity) {
+        used.add(best.receipt.artifact_id);
+        matches.push({ line, receipt: best.receipt, tier: best.tier, overlap: best.overlap, score: bestScore });
+      }
+    }
+    return matches;
+  }
+
+  async function runMatchReceipts(panel) {
+    const status = panel.querySelector('.__rf_acct_status');
+    const progressWrap = panel.querySelector('.__rf_progress_wrap');
+    const progressBar = panel.querySelector('.__rf_progress_bar');
+    const progressText = panel.querySelector('.__rf_progress_text');
+    const matchBtn = panel.querySelector('.__rf_match_btn');
+    const setProgress = (done, total) => {
+      const pct = total > 0 ? Math.min(100, (done / total) * 100) : 0;
+      progressBar.style.width = pct.toFixed(1) + '%';
+      progressText.textContent = total > 0 ? `${done} / ${total} (${pct.toFixed(0)}%)` : '';
+    };
+    progressBar.style.background = '#06c';
+    progressWrap.style.display = 'block';
+    progressText.style.display = 'block';
+    matchBtn.disabled = true; matchBtn.style.opacity = '0.6'; matchBtn.style.cursor = 'wait'; matchBtn.textContent = 'Matching…';
+    const beforeUnload = (e) => { e.preventDefault(); e.returnValue = ''; };
+    window.addEventListener('beforeunload', beforeUnload);
+    window.__rfAcctRunning = true;
+    try {
+      status.textContent = 'Reading wallet & reports…';
+      const receipts = readWalletReceipts();
+      if (!receipts.length) { status.textContent = 'No wallet receipts found in DOM. Make sure you are on the Expenses page with the wallet visible.'; return; }
+      const reports = await fetchAllDraftReports();
+      const usdRates = await fetchFxToUSD();
+      status.textContent = `${receipts.length} receipts, computing matches…`;
+      const matches = buildMatches(reports, receipts, usdRates);
+      if (!matches.length) { status.textContent = `No matches found across ${receipts.length} wallet receipts.`; return; }
+      const tierCounts = matches.reduce((acc, m) => { acc[m.tier] = (acc[m.tier] || 0) + 1; return acc; }, {});
+
+      const csrf = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content');
+      // Apply FIRST match, ask user to confirm
+      const first = matches[0];
+      status.textContent = `Applying first match (line ${first.line.line_id})…`;
+      const r = await fetch('/expenses/wallet/merge_receipt_to_expense_line', {
+        method: 'POST', credentials: 'include',
+        headers: {
+          'Accept': 'application/json, text/plain, */*',
+          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+          'X-CSRF-Token': csrf,
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+        body: `expense_line_id=${encodeURIComponent(first.line.line_id)}&wallet_expense_line_id=${encodeURIComponent(first.receipt.wallet_line_id)}`,
+      });
+      if (!r.ok) { status.textContent = `First merge failed (status ${r.status}). Aborting.`; return; }
+      const summary =
+        `<b>${matches.length} candidate matches found.</b><br>` +
+        `&bull; Tiers: ${Object.entries(tierCounts).map(([k,v]) => `${k}=${v}`).join(', ')}<br>` +
+        `<b>First applied:</b><br>` +
+        `&bull; Line <b>${first.line.line_id}</b> &mdash; ${escapeHtml(first.line.merchant.slice(0,40))} ${first.line.amount} ${first.line.currency}<br>` +
+        `&bull; Receipt &mdash; ${escapeHtml(first.receipt.merchant.slice(0,40))} ${first.receipt.amount} ${first.receipt.currency} (${escapeHtml(first.receipt.filename.slice(0,40))})<br>` +
+        `&bull; Tier: ${first.tier}, overlap=${first.overlap}`;
+      const ok = await showFirstLineConfirm(panel, summary);
+      if (!ok) {
+        status.textContent = `Stopped after first match. ${matches.length - 1} candidates not applied.`;
+        return;
+      }
+      const rest = matches.slice(1);
+      const total = matches.length;
+      let okCount = 1, failCount = 0;
+      const failures = [];
+      setProgress(okCount + failCount, total);
+      for (const m of rest) {
+        try {
+          const resp = await fetch('/expenses/wallet/merge_receipt_to_expense_line', {
+            method: 'POST', credentials: 'include',
+            headers: {
+              'Accept': 'application/json, text/plain, */*',
+              'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+              'X-CSRF-Token': csrf,
+              'X-Requested-With': 'XMLHttpRequest',
+            },
+            body: `expense_line_id=${encodeURIComponent(m.line.line_id)}&wallet_expense_line_id=${encodeURIComponent(m.receipt.wallet_line_id)}`,
+          });
+          if (resp.ok) okCount++;
+          else { failCount++; failures.push({ line_id: m.line.line_id, artifact_id: m.receipt.artifact_id, status: resp.status, head: (await resp.text()).slice(0, 200) }); }
+        } catch (e) { failCount++; failures.push({ line_id: m.line.line_id, error: String(e).slice(0,200) }); }
+        setProgress(okCount + failCount, total);
+        status.textContent = `ok=${okCount} fail=${failCount}`;
+        await new Promise(r => setTimeout(r, 250));
+      }
+      status.innerHTML = `<b>Match complete.</b> ok=${okCount} / fail=${failCount}` +
+        (failures.length ? ` <a href="data:application/json;base64,${btoa(JSON.stringify(failures, null, 2))}" download="match-receipts-failures.json" style="color:#06c;">download failures</a>` : '');
+      progressBar.style.background = failCount > 0 ? '#c60' : '#0a7';
+    } catch (e) {
+      status.textContent = 'Error: ' + ((e && e.message) ? e.message : String(e)).slice(0, 200);
+    } finally {
+      window.__rfAcctRunning = false;
+      window.removeEventListener('beforeunload', beforeUnload);
+      matchBtn.disabled = false; matchBtn.style.opacity = ''; matchBtn.style.cursor = 'pointer'; matchBtn.textContent = 'Match Receipts';
+    }
+  }
+
+  // ---------- help modal ----------
+  function showHelpModal() {
+    if (document.getElementById('__rf_help_modal')) return;
+    const overlay = document.createElement('div');
+    overlay.id = '__rf_help_modal';
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:100001;display:flex;align-items:center;justify-content:center;font:13px sans-serif;color:#222;';
+    overlay.innerHTML = `
+      <div style="background:#fff;padding:22px 26px;border-radius:8px;max-width:680px;max-height:88vh;overflow:auto;box-shadow:0 6px 22px rgba(0,0,0,0.3);">
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;">
+          <h2 style="margin:0 0 8px 0;color:#06c;">Coupa Receipt Filter — How it works</h2>
+          <button class="__rf_help_close" type="button" style="background:transparent;border:none;color:#888;font-size:22px;line-height:1;cursor:pointer;">&times;</button>
+        </div>
+        <p style="margin:6px 0 14px 0;color:#666;">A Tampermonkey userscript that bulk-edits Coupa expense reports. Lives at top-right of any Coupa <code>/expenses*</code> page and operates only on <b>draft</b> reports.</p>
+        <h3 style="margin:14px 0 4px 0;color:#222;">Buttons</h3>
+        <ul style="margin:0 0 0 18px;padding:0;line-height:1.55;">
+          <li><b>Apply Account to All</b> — PATCHes every draft line whose <code>accounts[]</code> doesn't already include the configured account (id <code>${DEFAULT_ACCOUNT.account_id}</code>, ${escapeHtml(DEFAULT_ACCOUNT.display_name)}). Skips lines that are already set, so re-running is safe and fast.</li>
+          <li><b>Match Receipts</b> — scans the wallet sidebar (<code>li.walletLine</code>) and pairs receipts to draft lines that don't yet have one. Tiers (highest score wins): exact same currency + amount → ±1% same currency + ≥1 token of merchant overlap → cross-currency within ±12% USD-equivalent + token overlap. Posts <code>/expenses/wallet/merge_receipt_to_expense_line</code> per match. Confirms the first match before applying the rest.</li>
+          <li><b>Download Non-Compliant</b> — generates an .xlsx of every draft line with at least one problem: missing receipt &gt; $25 USD-eq, missing account, missing category, or gift-meal whose value-per-attendee &gt; $25. Editable columns get <span style="background:#C8E6C9;padding:0 4px;">green headers</span>. Invalid cells light <span style="background:#FF6B6B;color:#fff;padding:0 4px;">red</span> (live conditional formatting).</li>
+          <li><b>Export All</b> — same xlsx structure but includes every draft line, not just non-compliant ones. Useful for a complete audit pass.</li>
+          <li><b>Upload &amp; Apply</b> — opens a file picker, ingests the edited xlsx, and PATCHes the lines. Compares each row against the line's live state and skips no-op rows. Confirms the first applied change before continuing.</li>
+        </ul>
+        <h3 style="margin:14px 0 4px 0;color:#222;">Workbook layout (Lines sheet)</h3>
+        <ul style="margin:0 0 0 18px;padding:0;line-height:1.55;">
+          <li>Read-only context: <code>line_id, report, merchant, date, amount, currency, usd_eq, current_category, problems, current_description, current_attendees</code>.</li>
+          <li>Editable (green header): <code>new_category</code> (dropdown of categories you've used), <code>new_description</code> (free text), <code>&lt;person&gt;</code> attendee columns (mark <code>x</code> to add).</li>
+          <li>Hidden helper sheet <code>_categories</code> drives both the dropdown and the upload's name→id resolution. Don't delete it.</li>
+        </ul>
+        <h3 style="margin:14px 0 4px 0;color:#222;">Workbook layout (Attendees sheet)</h3>
+        <ul style="margin:0 0 0 18px;padding:0;line-height:1.55;">
+          <li>Existing attendees you've used appear with their Coupa <code>id</code>, <code>type_id</code> (5 = Coupa user, 6 = manual entry), <code>first_name</code>, <code>last_name</code>.</li>
+          <li>To add a NEW attendee: append a row, leave <code>id</code> blank, set first &amp; last name. On upload, the script POSTs to <code>/expense_attendees/</code> to create them, then uses the returned id when applying any rows that reference that name.</li>
+          <li>To use a new attendee on a line, you must also add a column on Lines named <code>"first last"</code> (without an id) and put <code>x</code> in the row.</li>
+        </ul>
+        <h3 style="margin:14px 0 4px 0;color:#222;">Validation &amp; safety</h3>
+        <ul style="margin:0 0 0 18px;padding:0;line-height:1.55;">
+          <li>Conditional formatting marks invalid cells red live in Excel; the upload validates the same rules and aborts before any PATCH if it finds one (with a downloadable list of bad cells).</li>
+          <li>Yellow row tint = informational only (gift-meal value-per-attendee &gt; $25). Doesn't block anything.</li>
+          <li>While bulk operations are running, the page warns "Are you sure you want to leave?" if you try to navigate.</li>
+          <li>The first PATCH/merge of any bulk action requires confirmation in a modal so you can verify it took before the rest run.</li>
+          <li>Counters always reconcile: <code>ok + fail + skipped</code> = total rows the script considered.</li>
+        </ul>
+        <div style="text-align:right;margin-top:16px;">
+          <button class="__rf_help_close2" type="button" style="background:#06c;color:#fff;border:1px solid #048;padding:6px 14px;border-radius:3px;cursor:pointer;">Got it</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    const close = () => overlay.remove();
+    overlay.querySelector('.__rf_help_close').addEventListener('click', close);
+    overlay.querySelector('.__rf_help_close2').addEventListener('click', close);
+    overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+  }
+
   // ---------- persistent top-right account panel ----------
   function isExpensesPage() {
     return /\/expense(?:s|_reports)/i.test(location.pathname);
@@ -1150,12 +1408,15 @@
       'overflow-wrap:break-word',
     ].join(';');
     panel.innerHTML = `
-      <div style="display:flex;justify-content:flex-end;">
+      <div style="display:flex;justify-content:flex-end;gap:6px;">
+        <button class="__rf_panel_help" type="button" title="How this works" style="background:transparent;border:1px solid #888;border-radius:50%;width:18px;height:18px;cursor:pointer;color:#06c;font-size:11px;font-weight:bold;line-height:1;padding:0;">?</button>
         <button class="__rf_panel_collapse" type="button" title="Hide" style="background:transparent;border:none;cursor:pointer;color:#888;font-size:14px;line-height:1;padding:0;">&times;</button>
       </div>
-      <button class="__rf_apply_account_btn" type="button" style="background:#06c;color:#fff;border:1px solid #048;padding:5px 8px;border-radius:3px;cursor:pointer;width:100%;">Apply Account to All</button>
-      <button class="__rf_download_problems_btn" type="button" style="margin-top:5px;background:#fff;color:#06c;border:1px solid #06c;padding:5px 8px;border-radius:3px;cursor:pointer;width:100%;">Download Problems .xlsx</button>
-      <button class="__rf_upload_btn" type="button" style="margin-top:5px;background:#fff;color:#06c;border:1px solid #06c;padding:5px 8px;border-radius:3px;cursor:pointer;width:100%;">Upload &amp; Apply</button>
+      <button class="__rf_apply_account_btn" type="button" style="background:#06c;color:#fff;border:1px solid #048;padding:5px 8px;border-radius:3px;cursor:pointer;width:100%;white-space:nowrap;">Apply Account to All</button>
+      <button class="__rf_match_btn" type="button" style="margin-top:5px;background:#06c;color:#fff;border:1px solid #048;padding:5px 8px;border-radius:3px;cursor:pointer;width:100%;white-space:nowrap;">Match Receipts</button>
+      <button class="__rf_download_problems_btn" type="button" style="margin-top:5px;background:#fff;color:#06c;border:1px solid #06c;padding:5px 8px;border-radius:3px;cursor:pointer;width:100%;white-space:nowrap;">Download Non-Compliant</button>
+      <button class="__rf_export_all_btn" type="button" style="margin-top:5px;background:#fff;color:#06c;border:1px solid #06c;padding:5px 8px;border-radius:3px;cursor:pointer;width:100%;white-space:nowrap;">Export All</button>
+      <button class="__rf_upload_btn" type="button" style="margin-top:5px;background:#fff;color:#06c;border:1px solid #06c;padding:5px 8px;border-radius:3px;cursor:pointer;width:100%;white-space:nowrap;">Upload &amp; Apply</button>
       <input class="__rf_upload_file" type="file" accept=".xlsx" style="display:none;">
       <div class="__rf_progress_wrap" style="display:none;margin-top:6px;height:10px;background:#eef;border:1px solid #abc;border-radius:4px;overflow:hidden;">
         <div class="__rf_progress_bar" style="height:100%;width:0%;background:#06c;transition:width 200ms ease;"></div>
@@ -1185,17 +1446,40 @@
       runApplyAccountToAll(draftIds, panel);
     });
 
-    // Download Problems
+    // Match Receipts
+    panel.querySelector('.__rf_match_btn').addEventListener('click', async () => {
+      if (window.__rfAcctRunning) {
+        panel.querySelector('.__rf_acct_status').textContent = 'Already running…';
+        return;
+      }
+      if (!confirm('Auto-match wallet receipts to draft expense lines?\n\nMatches by:\n• same currency + exact amount\n• same currency + ±1% amount + similar merchant\n• cross-currency + ±12% USD-eq + similar merchant\n\nFirst match needs your confirmation before the rest are applied.')) return;
+      runMatchReceipts(panel);
+    });
+
+    // Download Non-Compliant
     panel.querySelector('.__rf_download_problems_btn').addEventListener('click', async () => {
       const status = panel.querySelector('.__rf_acct_status');
       try {
-        const { blob, problemRows } = await buildProblemsWorkbook(panel);
-        downloadBlob(blob, 'coupa-problems.xlsx');
-        status.textContent = `Downloaded ${problemRows} problem rows.`;
+        const { blob, problemRows } = await buildProblemsWorkbook(panel, { onlyProblems: true });
+        downloadBlob(blob, 'coupa-non-compliant.xlsx');
+        status.textContent = `Downloaded ${problemRows} non-compliant rows.`;
       } catch (e) {
         status.textContent = 'Download failed: ' + (e && e.message ? e.message : String(e)).slice(0, 200);
       }
     });
+    // Export All
+    panel.querySelector('.__rf_export_all_btn').addEventListener('click', async () => {
+      const status = panel.querySelector('.__rf_acct_status');
+      try {
+        const { blob, problemRows } = await buildProblemsWorkbook(panel, { onlyProblems: false });
+        downloadBlob(blob, 'coupa-all-draft-lines.xlsx');
+        status.textContent = `Downloaded ${problemRows} rows (all draft lines).`;
+      } catch (e) {
+        status.textContent = 'Download failed: ' + (e && e.message ? e.message : String(e)).slice(0, 200);
+      }
+    });
+    // Help (?)
+    panel.querySelector('.__rf_panel_help').addEventListener('click', () => showHelpModal());
 
     // Upload + Apply
     const fileInput = panel.querySelector('.__rf_upload_file');
