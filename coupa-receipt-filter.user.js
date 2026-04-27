@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Coupa Receipt Filter (Attach Receipt dialog, ±% across currencies)
 // @namespace    local.tylerkeller
-// @version      0.8.1
+// @version      0.8.2
 // @description  Filter the Coupa "Attach a receipt" dialog by ±X%, plus a top-right panel with Apply-Account-to-All, Download-Problems (xlsx with red/yellow row highlights AND conditional formatting on invalid entries), and Upload-and-Apply (description + attendee bulk edit with first-line confirmation + progress bar).
 // @match        https://*.coupahost.com/*
 // @run-at       document-idle
@@ -42,7 +42,7 @@
     localStorage.removeItem(ACTIVE_ACCOUNT_LSKEY);
   }
 
-  const SCRIPT_VERSION = '0.8.1';
+  const SCRIPT_VERSION = '0.8.2';
   const SCRIPT_UPDATE_URL = 'https://gist.githubusercontent.com/SexualMoose/a0de5a5bf56d33abef414b5781bdd984/raw/coupa-receipt-filter.user.js';
   const EXCELJS_URL = 'https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js';
   const FX_BASE_URL = 'https://open.er-api.com/v6/latest/USD';
@@ -1685,10 +1685,12 @@
     });
     // Help (?)
     panel.querySelector('.__rf_panel_help').addEventListener('click', () => showHelpModal());
-    // Update (↻) — opens the @updateURL in a new tab; Tampermonkey detects the
-    // .user.js URL and prompts to install/update.
+    // Update (↻) — opens the @updateURL in a new tab with a cache-buster so
+    // GitHub's 5-min CDN cache can't serve a stale revision. Tampermonkey detects
+    // the .user.js URL and prompts to install/update.
     panel.querySelector('.__rf_panel_update').addEventListener('click', () => {
-      window.open(SCRIPT_UPDATE_URL, '_blank', 'noopener');
+      const url = SCRIPT_UPDATE_URL + (SCRIPT_UPDATE_URL.includes('?') ? '&' : '?') + 'cb=' + Date.now();
+      window.open(url, '_blank', 'noopener');
     });
 
     // Account editor (✎)
