@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Coupa Receipt Filter (Attach Receipt dialog, ±% across currencies)
 // @namespace    local.tylerkeller
-// @version      0.8.3
+// @version      0.8.4
 // @description  Filter the Coupa "Attach a receipt" dialog by ±X%, plus a top-right panel with Apply-Account-to-All, Download-Problems (xlsx with red/yellow row highlights AND conditional formatting on invalid entries), and Upload-and-Apply (description + attendee bulk edit with first-line confirmation + progress bar).
 // @match        https://*.coupahost.com/*
 // @run-at       document-idle
@@ -42,7 +42,7 @@
     localStorage.removeItem(ACTIVE_ACCOUNT_LSKEY);
   }
 
-  const SCRIPT_VERSION = '0.8.3';
+  const SCRIPT_VERSION = '0.8.4';
   // Palette used to randomize the help-modal accent color each open
   const HELP_PALETTE = [
     { fg: '#1976D2', name: 'blue' },
@@ -1540,16 +1540,18 @@
   function showHelpModal() {
     if (document.getElementById('__rf_help_modal')) return;
     const accent = pickHelpAccent();
+    // Console log so the user can verify the script is running v0.8.4+ and a color was picked
+    try { console.log(`[CoupaReceiptFilter v${SCRIPT_VERSION}] Help modal accent: ${accent}`); } catch {}
     const overlay = document.createElement('div');
     overlay.id = '__rf_help_modal';
     overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:100001;display:flex;align-items:center;justify-content:center;font:13px sans-serif;color:#222;';
     overlay.innerHTML = `
-      <div style="background:#fff;padding:22px 26px;border-radius:8px;max-width:680px;max-height:88vh;overflow:auto;box-shadow:0 6px 22px rgba(0,0,0,0.3);border-top:4px solid ${accent};">
+      <div style="background:#fff;padding:22px 26px 22px 36px;border-radius:8px;max-width:680px;max-height:88vh;overflow:auto;box-shadow:0 6px 22px rgba(0,0,0,0.3);border-left:10px solid ${accent};border-top:4px solid ${accent};position:relative;">
         <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;">
           <h2 style="margin:0 0 8px 0;color:${accent};">Coupa Receipt Filter — How it works</h2>
           <button class="__rf_help_close" type="button" style="background:transparent;border:none;color:#888;font-size:22px;line-height:1;cursor:pointer;">&times;</button>
         </div>
-        <p style="margin:6px 0 14px 0;color:#666;">A Tampermonkey userscript that bulk-edits Coupa expense reports. Lives at top-right of any Coupa <code>/expenses*</code> page and operates only on <b>draft</b> reports.</p>
+        <p style="margin:6px 0 14px 0;color:#666;">A Tampermonkey userscript that bulk-edits Coupa expense reports. Lives at top-right of any Coupa <code>/expenses*</code> page and operates only on <b>draft</b> reports. <span style="color:${accent};font-weight:bold;">v${SCRIPT_VERSION}</span></p>
         <h3 style="margin:14px 0 4px 0;color:${accent};">Buttons</h3>
         <ul style="margin:0 0 0 18px;padding:0;line-height:1.55;">
           <li><b>Apply Account to All</b> — PATCHes every draft line whose <code>accounts[]</code> doesn't already include the configured account (currently id <code>${getActiveAccount().account_id}</code>, ${escapeHtml(getActiveAccount().display_name)}). Skips lines that are already set, so re-running is safe and fast.</li>
@@ -1599,6 +1601,19 @@
   function mountAccountPanel() {
     if (!isExpensesPage()) return;
     if (document.getElementById('__rf_acct_panel')) return;
+    // Pick a fresh accent color for the entire panel each load
+    const accent = pickHelpAccent();
+    // Slightly darker shade for borders on solid buttons (just darken hex by 30%)
+    const darken = (hex) => {
+      const m = hex.replace('#', '');
+      const n = parseInt(m, 16);
+      const r = Math.max(0, ((n >> 16) & 0xff) - 40);
+      const g = Math.max(0, ((n >> 8) & 0xff) - 40);
+      const b = Math.max(0, (n & 0xff) - 40);
+      return '#' + [r, g, b].map(x => x.toString(16).padStart(2, '0')).join('');
+    };
+    const accentDark = darken(accent);
+    try { console.log(`[CoupaReceiptFilter v${SCRIPT_VERSION}] Panel accent: ${accent}`); } catch {}
     const panel = document.createElement('div');
     panel.id = '__rf_acct_panel';
     panel.style.cssText = [
@@ -1608,7 +1623,7 @@
       'z-index:99999',
       'padding:8px 10px',
       'background:#fff',
-      'border:1px solid #06c',
+      `border:1px solid ${accent}`,
       'border-radius:6px',
       'font:12px sans-serif',
       'box-shadow:0 2px 8px rgba(0,0,0,.15)',
@@ -1622,31 +1637,31 @@
       <div style="display:flex;justify-content:flex-end;">
         <button class="__rf_panel_collapse" type="button" title="Hide" style="background:transparent;border:none;cursor:pointer;color:#888;font-size:14px;line-height:1;padding:0;">&times;</button>
       </div>
-      <button class="__rf_apply_account_btn" type="button" style="background:#06c;color:#fff;border:1px solid #048;padding:5px 8px;border-radius:3px;cursor:pointer;width:100%;white-space:nowrap;">Apply Account to All</button>
-      <button class="__rf_match_btn" type="button" style="margin-top:5px;background:#06c;color:#fff;border:1px solid #048;padding:5px 8px;border-radius:3px;cursor:pointer;width:100%;white-space:nowrap;">Match Receipts</button>
-      <button class="__rf_download_problems_btn" type="button" style="margin-top:5px;background:#fff;color:#06c;border:1px solid #06c;padding:5px 8px;border-radius:3px;cursor:pointer;width:100%;white-space:nowrap;">Export Non-Compliant</button>
-      <button class="__rf_export_all_btn" type="button" style="margin-top:5px;background:#fff;color:#06c;border:1px solid #06c;padding:5px 8px;border-radius:3px;cursor:pointer;width:100%;white-space:nowrap;">Export All</button>
-      <button class="__rf_upload_btn" type="button" style="margin-top:5px;background:#fff;color:#06c;border:1px solid #06c;padding:5px 8px;border-radius:3px;cursor:pointer;width:100%;white-space:nowrap;">Upload &amp; Apply</button>
+      <button class="__rf_apply_account_btn" type="button" style="background:${accent};color:#fff;border:1px solid ${accentDark};padding:5px 8px;border-radius:3px;cursor:pointer;width:100%;white-space:nowrap;">Apply Account to All</button>
+      <button class="__rf_match_btn" type="button" style="margin-top:5px;background:${accent};color:#fff;border:1px solid ${accentDark};padding:5px 8px;border-radius:3px;cursor:pointer;width:100%;white-space:nowrap;">Match Receipts</button>
+      <button class="__rf_download_problems_btn" type="button" style="margin-top:5px;background:#fff;color:${accent};border:1px solid ${accent};padding:5px 8px;border-radius:3px;cursor:pointer;width:100%;white-space:nowrap;">Export Non-Compliant</button>
+      <button class="__rf_export_all_btn" type="button" style="margin-top:5px;background:#fff;color:${accent};border:1px solid ${accent};padding:5px 8px;border-radius:3px;cursor:pointer;width:100%;white-space:nowrap;">Export All</button>
+      <button class="__rf_upload_btn" type="button" style="margin-top:5px;background:#fff;color:${accent};border:1px solid ${accent};padding:5px 8px;border-radius:3px;cursor:pointer;width:100%;white-space:nowrap;">Upload &amp; Apply</button>
       <input class="__rf_upload_file" type="file" accept=".xlsx" style="display:none;">
       <div class="__rf_progress_wrap" style="display:none;margin-top:6px;height:10px;background:#eef;border:1px solid #abc;border-radius:4px;overflow:hidden;">
-        <div class="__rf_progress_bar" style="height:100%;width:0%;background:#06c;transition:width 200ms ease;"></div>
+        <div class="__rf_progress_bar" style="height:100%;width:0%;background:${accent};transition:width 200ms ease;"></div>
       </div>
-      <div class="__rf_progress_text" style="display:none;margin-top:3px;font-size:10px;color:#06c;text-align:center;font-variant-numeric:tabular-nums;"></div>
+      <div class="__rf_progress_text" style="display:none;margin-top:3px;font-size:10px;color:${accent};text-align:center;font-variant-numeric:tabular-nums;"></div>
       <div class="__rf_acct_block" style="margin-top:6px;font-size:11px;line-height:1.3;word-break:break-word;">
         <div style="display:flex;align-items:center;gap:4px;">
           <b style="flex:0 0 auto;">Account:</b>
-          <button class="__rf_acct_edit" type="button" title="Pick a different account" style="flex:0 0 auto;background:transparent;border:none;cursor:pointer;color:#06c;font-size:11px;padding:0;">&#9998;</button>
+          <button class="__rf_acct_edit" type="button" title="Pick a different account" style="flex:0 0 auto;background:transparent;border:none;cursor:pointer;color:${accent};font-size:11px;padding:0;">&#9998;</button>
           <button class="__rf_acct_reset" type="button" title="Revert to script default" style="flex:0 0 auto;background:transparent;border:none;cursor:pointer;color:#888;font-size:13px;padding:0;">&#x21BA;</button>
         </div>
         <div class="__rf_acct_name" style="margin-top:2px;"></div>
         <div class="__rf_acct_code" style="color:#888;"></div>
       </div>
-      <div class="__rf_acct_status" style="margin-top:6px;font-size:11px;color:#06c;min-height:14px;word-break:break-word;"></div>
+      <div class="__rf_acct_status" style="margin-top:6px;font-size:11px;color:${accent};min-height:14px;word-break:break-word;"></div>
       <div style="margin-top:8px;padding-top:6px;border-top:1px solid #eee;display:flex;align-items:center;justify-content:space-between;">
         <span class="__rf_version" style="font-size:10px;color:#888;">v${SCRIPT_VERSION}</span>
         <span style="display:flex;gap:6px;">
-          <button class="__rf_panel_update" type="button" title="Check for / install latest version" style="background:transparent;border:1px solid #888;border-radius:50%;width:20px;height:20px;cursor:pointer;color:#06c;font-size:13px;line-height:1;padding:0;">&#x21BB;</button>
-          <button class="__rf_panel_help" type="button" title="How this works" style="background:transparent;border:1px solid #888;border-radius:50%;width:20px;height:20px;cursor:pointer;color:#06c;font-size:11px;font-weight:bold;line-height:1;padding:0;">?</button>
+          <button class="__rf_panel_update" type="button" title="Check for / install latest version" style="background:transparent;border:1px solid #888;border-radius:50%;width:20px;height:20px;cursor:pointer;color:${accent};font-size:13px;line-height:1;padding:0;">&#x21BB;</button>
+          <button class="__rf_panel_help" type="button" title="How this works" style="background:transparent;border:1px solid #888;border-radius:50%;width:20px;height:20px;cursor:pointer;color:${accent};font-size:11px;font-weight:bold;line-height:1;padding:0;">?</button>
         </span>
       </div>
     `;
