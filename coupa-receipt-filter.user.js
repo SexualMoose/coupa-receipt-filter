@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Coupa Receipt Filter (Attach Receipt dialog, ±% across currencies)
 // @namespace    local.tylerkeller
-// @version      0.4.2
-// @description  Filter the Coupa "Attach a receipt" dialog to receipts within ±X% of the expense line's Total Amount (USD/EUR/COP/SGD/TRY). Adds a persistent top-right panel on the Expenses page with an "Apply Account to All" button (skips lines that already have the configured account).
+// @version      0.4.3
+// @description  Filter the Coupa "Attach a receipt" dialog to receipts within ±X% of the expense line's Total Amount (USD/EUR/COP/SGD/TRY). Adds a compact top-right panel with an "Apply Account to All" button (skips lines that already have the configured account).
 // @match        https://*.coupahost.com/*
 // @run-at       document-idle
 // @grant        GM_xmlhttpRequest
@@ -391,28 +391,28 @@
       'top:10px',
       'right:10px',
       'z-index:99999',
-      'padding:10px 12px',
+      'padding:8px 10px',
       'background:#fff',
       'border:1px solid #06c',
       'border-radius:6px',
       'font:12px sans-serif',
       'box-shadow:0 2px 8px rgba(0,0,0,.15)',
-      'max-width:340px',
+      'width:170px',
+      'box-sizing:border-box',
       'color:#222',
+      'word-wrap:break-word',
+      'overflow-wrap:break-word',
     ].join(';');
     panel.innerHTML = `
-      <div style="display:flex;gap:8px;align-items:center;justify-content:space-between;">
-        <strong style="color:#06c;">Coupa Receipt Filter</strong>
-        <button class="__rf_panel_collapse" type="button" title="Hide" style="background:transparent;border:none;cursor:pointer;color:#888;">&times;</button>
+      <div style="display:flex;justify-content:flex-end;">
+        <button class="__rf_panel_collapse" type="button" title="Hide" style="background:transparent;border:none;cursor:pointer;color:#888;font-size:14px;line-height:1;padding:0;">&times;</button>
       </div>
-      <div style="margin-top:6px;">
-        <button class="__rf_apply_account_btn" type="button" style="background:#06c;color:#fff;border:1px solid #048;padding:5px 10px;border-radius:3px;cursor:pointer;">Apply Account to All</button>
-      </div>
-      <div style="margin-top:6px;font-size:11px;line-height:1.3;">
+      <button class="__rf_apply_account_btn" type="button" style="background:#06c;color:#fff;border:1px solid #048;padding:5px 8px;border-radius:3px;cursor:pointer;width:100%;">Apply Account to All</button>
+      <div style="margin-top:6px;font-size:11px;line-height:1.3;word-break:break-word;">
         <b>Account:</b> ${DEFAULT_ACCOUNT.display_name}<br>
         <span style="color:#888;">id ${DEFAULT_ACCOUNT.account_id} &middot; ${DEFAULT_ACCOUNT.code}</span>
       </div>
-      <div class="__rf_acct_status" style="margin-top:6px;font-size:11px;color:#06c;min-height:14px;"></div>
+      <div class="__rf_acct_status" style="margin-top:6px;font-size:11px;color:#06c;min-height:14px;word-break:break-word;"></div>
     `;
     document.body.appendChild(panel);
     panel.querySelector('.__rf_panel_collapse').addEventListener('click', () => panel.remove());
