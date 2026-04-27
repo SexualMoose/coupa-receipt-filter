@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Coupa Receipt Filter (Attach Receipt dialog, ±% across currencies)
 // @namespace    local.tylerkeller
-// @version      0.5.0
-// @description  Filter the Coupa "Attach a receipt" dialog by ±X%, plus a top-right panel with Apply-Account-to-All, Download-Problems (xlsx with red/yellow highlights), and Upload-and-Apply (description + attendee bulk edit with first-line confirmation + progress bar).
+// @version      0.5.1
+// @description  Filter the Coupa "Attach a receipt" dialog by ±X%, plus a top-right panel with Apply-Account-to-All, Download-Problems (xlsx with red/yellow row highlights AND conditional formatting on invalid entries), and Upload-and-Apply (description + attendee bulk edit with first-line confirmation + progress bar).
 // @match        https://*.coupahost.com/*
 // @run-at       document-idle
 // @grant        GM_xmlhttpRequest
@@ -556,6 +556,30 @@
       });
     });
 
+    // Conditional formatting on Lines: red-fill any cell in attendee columns that
+    // is non-empty AND not "x"/"X". Range covers all attendee columns and ample rows.
+    const colLetter = (n) => {
+      let s = '';
+      while (n > 0) { const r = (n - 1) % 26; s = String.fromCharCode(65 + r) + s; n = Math.floor((n - 1) / 26); }
+      return s;
+    };
+    const attCol1Letter = colLetter(13);
+    const attColLastLetter = colLetter(headers.length);
+    const refRange = `${attCol1Letter}2:${attColLastLetter}10000`;
+    sh.addConditionalFormatting({
+      ref: refRange,
+      rules: [{
+        type: 'expression',
+        priority: 1,
+        formulae: [`AND(LEN(${attCol1Letter}2)>0, UPPER(${attCol1Letter}2)<>"X")`],
+        style: {
+          fill: { type: 'pattern', pattern: 'solid', bgColor: { argb: 'FFFF6B6B' } },
+          font: { color: { argb: 'FFFFFFFF' }, bold: true },
+        },
+      }],
+    });
+    // Conditional formatting on new_description column (col K, idx 11): nothing to validate; left clean.
+
     // Attendees sheet
     const ash = wb.addWorksheet('Attendees');
     ash.addRow(['id', 'type_id', 'first_name', 'last_name']);
@@ -563,10 +587,38 @@
     ash.views = [{ state: 'frozen', ySplit: 1 }];
     [10, 10, 22, 22].forEach((w, i) => { ash.getColumn(i + 1).width = w; });
     attendees.forEach(a => ash.addRow([a.id, a.type_id || NEW_ATTENDEE_TYPE_ID, a.first_name, a.last_name]));
-    // Note row to instruct
     const noteRow = ash.addRow(['', '', '', '']);
-    noteRow.getCell(1).value = 'To add a NEW attendee: append a row with id BLANK, leave type_id blank (defaults to 6), set first_name and last_name. Use the new name as a column header on the Lines sheet to mark X.';
+    noteRow.getCell(1).value = 'To add a NEW attendee: append a row with id BLANK, leave type_id blank (defaults to 6), set first_name and last_name. Use "first last" as a column header on the Lines sheet to mark X.';
     noteRow.getCell(1).font = { italic: true, color: { argb: 'FF888888' } };
+
+    // Conditional formatting on Attendees:
+    // - id column (A): red if non-empty AND not numeric
+    // - type_id column (B): red if non-empty AND not 5 or 6
+    // - first_name (C) / last_name (D): red if both blank when id is blank (i.e., empty new row not allowed without name)
+    ash.addConditionalFormatting({
+      ref: 'A2:A10000',
+      rules: [{
+        type: 'expression',
+        priority: 1,
+        formulae: ['AND(LEN(A2)>0, NOT(ISNUMBER(A2)))'],
+        style: {
+          fill: { type: 'pattern', pattern: 'solid', bgColor: { argb: 'FFFF6B6B' } },
+          font: { color: { argb: 'FFFFFFFF' }, bold: true },
+        },
+      }],
+    });
+    ash.addConditionalFormatting({
+      ref: 'B2:B10000',
+      rules: [{
+        type: 'expression',
+        priority: 1,
+        formulae: ['AND(LEN(B2)>0, NOT(OR(B2=5, B2=6)))'],
+        style: {
+          fill: { type: 'pattern', pattern: 'solid', bgColor: { argb: 'FFFF6B6B' } },
+          font: { color: { argb: 'FFFFFFFF' }, bold: true },
+        },
+      }],
+    });
 
     status.textContent = `Building xlsx (${problemRows} problem rows)…`;
     const buf = await wb.xlsx.writeBuffer();
@@ -592,8 +644,8 @@
     const attendeesSheet = wb.getWorksheet('Attendees');
     if (!linesSheet || !attendeesSheet) throw new Error('Workbook must contain "Lines" and "Attendees" sheets.');
 
-    // Parse Attendees
-    const attHeaders = linesSheet.getRow(1).values.slice(1).map(v => v == null ? '' : String(v));
+    // Validate + parse Attendees
+    const validationErrors = [];
     const attendees = [];
     attendeesSheet.eachRow({ includeEmpty: false }, (row, idx) => {
       if (idx === 1) return;
@@ -602,6 +654,18 @@
       const first_name = row.getCell(3).value;
       const last_name = row.getCell(4).value;
       if (!first_name && !last_name && !id) return;
+      // id must be numeric or empty
+      if (id != null && id !== '' && isNaN(Number(id))) {
+        validationErrors.push(`Attendees!A${idx}: id "${id}" is not numeric`);
+      }
+      // type_id must be 5 or 6 if present
+      if (type_id != null && type_id !== '' && Number(type_id) !== 5 && Number(type_id) !== 6) {
+        validationErrors.push(`Attendees!B${idx}: type_id "${type_id}" must be 5 or 6`);
+      }
+      // If creating a new attendee (no id), must have first_name and last_name
+      if ((!id || id === '') && (!first_name || !last_name)) {
+        validationErrors.push(`Attendees!A${idx}: new attendee row requires first_name AND last_name`);
+      }
       attendees.push({
         id: id ? Number(id) : null,
         type_id: type_id ? Number(type_id) : NEW_ATTENDEE_TYPE_ID,
@@ -629,6 +693,7 @@
     const attendeeColStart = colIdx('current_attendees') + 1;
 
     const changes = [];
+    const colLet = (n) => { let s = ''; while (n > 0) { const r = (n - 1) % 26; s = String.fromCharCode(65 + r) + s; n = Math.floor((n - 1) / 26); } return s; };
     linesSheet.eachRow({ includeEmpty: false }, (row, idx) => {
       if (idx === 1) return;
       const lineId = Number(row.getCell(COL_LINE_ID).value);
@@ -637,10 +702,16 @@
       const markedAttendees = [];
       for (let c = attendeeColStart; c <= headers.length; c++) {
         const v = row.getCell(c).value;
-        if (v && String(v).trim().toLowerCase() === 'x') {
+        if (v == null || v === '') continue;
+        const sv = String(v).trim();
+        if (sv.toLowerCase() === 'x') {
           const label = headers[c - 1];
           const att = labelToAttendee.get(label);
           if (att) markedAttendees.push(att);
+          else validationErrors.push(`Lines!${colLet(c)}${idx}: attendee column header "${label}" not found in Attendees sheet`);
+        } else {
+          // Anything other than empty or 'x' is an invalid mark
+          validationErrors.push(`Lines!${colLet(c)}${idx}: invalid value "${sv}" (must be blank or "x")`);
         }
       }
       if ((newDesc && String(newDesc).trim()) || markedAttendees.length) {
@@ -652,6 +723,11 @@
       }
     });
 
+    if (validationErrors.length) {
+      const err = new Error(`Upload has ${validationErrors.length} invalid cell(s):\n` + validationErrors.slice(0, 10).join('\n') + (validationErrors.length > 10 ? `\n...and ${validationErrors.length - 10} more` : ''));
+      err.validationErrors = validationErrors;
+      throw err;
+    }
     return { attendees, changes };
   }
 
@@ -850,7 +926,14 @@
         (failures.length ? ` <a href="data:application/json;base64,${btoa(JSON.stringify(failures, null, 2))}" download="upload-apply-failures.json" style="color:#06c;">download failures</a>` : '');
       progressBar.style.background = failCount > 0 ? '#c60' : '#0a7';
     } catch (e) {
-      status.textContent = 'Error: ' + (e && e.message ? e.message : String(e)).slice(0, 200);
+      const msg = (e && e.message ? e.message : String(e));
+      if (e && e.validationErrors) {
+        const blob = new Blob([e.validationErrors.join('\n')], { type: 'text/plain' });
+        const url = URL.createObjectURL(blob);
+        status.innerHTML = `Upload aborted: ${e.validationErrors.length} invalid cell(s). <a href="${url}" download="upload-validation-errors.txt" style="color:#06c;">download list</a>`;
+      } else {
+        status.textContent = 'Error: ' + msg.slice(0, 200);
+      }
     } finally {
       window.__rfAcctRunning = false;
       window.removeEventListener('beforeunload', beforeUnload);
