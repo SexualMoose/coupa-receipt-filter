@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Coupa Receipt Filter (Attach Receipt dialog, ±% across currencies)
 // @namespace    local.tylerkeller
-// @version      0.4.0
-// @description  Filter the Coupa "Attach a receipt" dialog to receipts within ±X% of the expense line's Total Amount (USD/EUR/COP/SGD/TRY). Also adds an "Apply Account to All" button that PATCHes every draft expense line with a configured account.
+// @version      0.4.1
+// @description  Filter the Coupa "Attach a receipt" dialog to receipts within ±X% of the expense line's Total Amount (USD/EUR/COP/SGD/TRY). Also adds an "Apply Account to All" button that PATCHes every draft expense line that doesn't already have the configured account.
 // @match        https://*.coupahost.com/*
 // @run-at       document-idle
 // @grant        GM_xmlhttpRequest
@@ -19,6 +19,8 @@
   const DEFAULT_ACCOUNT = {
     account_id: 6222,        // returned id from /accounts/select_dynamic_account
     account_type_id: 4,       // US1
+    display_name: 'PHILADELPHIA-Finance Systems & Projects-NONE-Miscellaneous expenses',
+    code: 'US010-26001-999-NONE-70919900',
   };
 
   const TARGETS = ['USD', 'EUR', 'COP', 'SGD', 'TRY'];
@@ -120,7 +122,11 @@
         <button class="__rf_clear" type="button">Show all</button>
         <button class="__rf_fx" type="button" title="Refetch FX">&#8635; FX</button>
         <span style="border-left:1px solid #c69; margin:0 4px; height:18px;"></span>
-        <button class="__rf_apply_account" type="button" title="PATCH every line in every draft report with the configured account" style="background:#06c;color:#fff;border:1px solid #048;padding:3px 8px;border-radius:3px;">Apply Account to All</button>
+        <button class="__rf_apply_account" type="button" title="PATCH every line in every draft report with the configured account (skips lines that already have it)" style="background:#06c;color:#fff;border:1px solid #048;padding:3px 8px;border-radius:3px;">Apply Account to All</button>
+      </div>
+      <div class="__rf_acct_info" style="margin-top:4px;color:#06c;font-size:11px;">
+        <b>Account:</b> ${DEFAULT_ACCOUNT.display_name}
+        <span style="color:#888;">(id ${DEFAULT_ACCOUNT.account_id} — ${DEFAULT_ACCOUNT.code})</span>
       </div>
       <div class="__rf_meta" style="margin-top:6px;color:#222;"></div>
       <div class="__rf_targets" style="margin-top:4px;color:#444;"></div>
@@ -319,7 +325,7 @@
       'X-CSRF-Token': csrf,
       'X-Requested-With': 'XMLHttpRequest',
     };
-    let ok = 0, fail = 0, skipped = 0, total = 0;
+    let ok = 0, fail = 0, skipped = 0;
     const failures = [];
     statusEl.textContent = 'Fetching reports…';
 
@@ -334,10 +340,17 @@
         failures.push({ report_id: rid, error: 'fetch failed: ' + String(e).slice(0, 100) });
       }
     }
-    total = allLines.length;
-    statusEl.textContent = `Patching 0/${total}…`;
 
-    for (const line of allLines) {
+    // Skip lines that already have the target account assigned.
+    const needsUpdate = allLines.filter(l => {
+      const accounts = Array.isArray(l.accounts) ? l.accounts : [];
+      return !accounts.some(a => Number(a.account_id) === DEFAULT_ACCOUNT.account_id);
+    });
+    skipped = allLines.length - needsUpdate.length;
+    const total = needsUpdate.length;
+    statusEl.textContent = `${skipped} already have account, patching ${total}…`;
+
+    for (const line of needsUpdate) {
       try {
         const r = await fetch(`/expenses/expense_lines/${line.id}`, {
           method: 'PATCH',
@@ -352,12 +365,12 @@
       }
       const done = ok + fail;
       if (done % 5 === 0 || done === total) {
-        statusEl.textContent = `${done}/${total} ok=${ok} fail=${fail}`;
+        statusEl.textContent = `${done}/${total} ok=${ok} fail=${fail} (skipped ${skipped} already-set)`;
       }
       await new Promise(r => setTimeout(r, 120));
     }
     window.__rfAcctRunning = false;
-    statusEl.innerHTML = `<b>Account apply complete.</b> ok=${ok} / fail=${fail}` +
+    statusEl.innerHTML = `<b>Account apply complete.</b> ok=${ok} / fail=${fail} / skipped ${skipped}` +
       (failures.length ? ` <a href="data:application/json;base64,${btoa(JSON.stringify(failures, null, 2))}" download="account-apply-failures.json" style="color:#06c;">download failures</a>` : '');
   }
 
