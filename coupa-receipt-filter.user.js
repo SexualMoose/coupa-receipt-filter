@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Coupa Receipt Filter (Attach Receipt dialog, ±% across currencies)
 // @namespace    local.tylerkeller
-// @version      0.8.0
+// @version      0.8.1
 // @description  Filter the Coupa "Attach a receipt" dialog by ±X%, plus a top-right panel with Apply-Account-to-All, Download-Problems (xlsx with red/yellow row highlights AND conditional formatting on invalid entries), and Upload-and-Apply (description + attendee bulk edit with first-line confirmation + progress bar).
 // @match        https://*.coupahost.com/*
 // @run-at       document-idle
@@ -42,6 +42,8 @@
     localStorage.removeItem(ACTIVE_ACCOUNT_LSKEY);
   }
 
+  const SCRIPT_VERSION = '0.8.1';
+  const SCRIPT_UPDATE_URL = 'https://gist.githubusercontent.com/SexualMoose/a0de5a5bf56d33abef414b5781bdd984/raw/coupa-receipt-filter.user.js';
   const EXCELJS_URL = 'https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js';
   const FX_BASE_URL = 'https://open.er-api.com/v6/latest/USD';
   const PROBLEM_USD_THRESHOLD = 25;
@@ -1600,8 +1602,7 @@
       'overflow-wrap:break-word',
     ].join(';');
     panel.innerHTML = `
-      <div style="display:flex;justify-content:flex-end;gap:6px;">
-        <button class="__rf_panel_help" type="button" title="How this works" style="background:transparent;border:1px solid #888;border-radius:50%;width:18px;height:18px;cursor:pointer;color:#06c;font-size:11px;font-weight:bold;line-height:1;padding:0;">?</button>
+      <div style="display:flex;justify-content:flex-end;">
         <button class="__rf_panel_collapse" type="button" title="Hide" style="background:transparent;border:none;cursor:pointer;color:#888;font-size:14px;line-height:1;padding:0;">&times;</button>
       </div>
       <button class="__rf_apply_account_btn" type="button" style="background:#06c;color:#fff;border:1px solid #048;padding:5px 8px;border-radius:3px;cursor:pointer;width:100%;white-space:nowrap;">Apply Account to All</button>
@@ -1624,6 +1625,13 @@
         <div class="__rf_acct_code" style="color:#888;"></div>
       </div>
       <div class="__rf_acct_status" style="margin-top:6px;font-size:11px;color:#06c;min-height:14px;word-break:break-word;"></div>
+      <div style="margin-top:8px;padding-top:6px;border-top:1px solid #eee;display:flex;align-items:center;justify-content:space-between;">
+        <span class="__rf_version" style="font-size:10px;color:#888;">v${SCRIPT_VERSION}</span>
+        <span style="display:flex;gap:6px;">
+          <button class="__rf_panel_update" type="button" title="Check for / install latest version" style="background:transparent;border:1px solid #888;border-radius:50%;width:20px;height:20px;cursor:pointer;color:#06c;font-size:13px;line-height:1;padding:0;">&#x21BB;</button>
+          <button class="__rf_panel_help" type="button" title="How this works" style="background:transparent;border:1px solid #888;border-radius:50%;width:20px;height:20px;cursor:pointer;color:#06c;font-size:11px;font-weight:bold;line-height:1;padding:0;">?</button>
+        </span>
+      </div>
     `;
     document.body.appendChild(panel);
     panel.querySelector('.__rf_panel_collapse').addEventListener('click', () => panel.remove());
@@ -1677,6 +1685,11 @@
     });
     // Help (?)
     panel.querySelector('.__rf_panel_help').addEventListener('click', () => showHelpModal());
+    // Update (↻) — opens the @updateURL in a new tab; Tampermonkey detects the
+    // .user.js URL and prompts to install/update.
+    panel.querySelector('.__rf_panel_update').addEventListener('click', () => {
+      window.open(SCRIPT_UPDATE_URL, '_blank', 'noopener');
+    });
 
     // Account editor (✎)
     panel.querySelector('.__rf_acct_edit').addEventListener('click', () => showAccountEditor(panel));
