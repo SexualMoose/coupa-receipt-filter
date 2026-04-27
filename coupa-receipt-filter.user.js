@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Coupa Receipt Filter (Attach Receipt dialog, ±% across currencies)
 // @namespace    local.tylerkeller
-// @version      0.7.1
+// @version      0.8.0
 // @description  Filter the Coupa "Attach a receipt" dialog by ±X%, plus a top-right panel with Apply-Account-to-All, Download-Problems (xlsx with red/yellow row highlights AND conditional formatting on invalid entries), and Upload-and-Apply (description + attendee bulk edit with first-line confirmation + progress bar).
 // @match        https://*.coupahost.com/*
 // @run-at       document-idle
@@ -18,12 +18,29 @@
   // Default account to bulk-apply via the toolbar button.
   // Capture these values from your tenant by clicking "Choose" on a representative
   // line and watching POST /accounts/select_dynamic_account in DevTools Network.
-  const DEFAULT_ACCOUNT = {
+  const DEFAULT_ACCOUNT = Object.freeze({
     account_id: 6222,        // returned id from /accounts/select_dynamic_account
     account_type_id: 4,       // US1
     display_name: 'PHILADELPHIA-Finance Systems & Projects-NONE-Miscellaneous expenses',
     code: 'US010-26001-999-NONE-70919900',
-  };
+  });
+  const ACTIVE_ACCOUNT_LSKEY = '__rf_active_account_v1';
+  function getActiveAccount() {
+    try {
+      const raw = localStorage.getItem(ACTIVE_ACCOUNT_LSKEY);
+      if (raw) {
+        const obj = JSON.parse(raw);
+        if (obj && obj.account_id) return obj;
+      }
+    } catch {}
+    return DEFAULT_ACCOUNT;
+  }
+  function setActiveAccount(obj) {
+    localStorage.setItem(ACTIVE_ACCOUNT_LSKEY, JSON.stringify(obj));
+  }
+  function resetActiveAccount() {
+    localStorage.removeItem(ACTIVE_ACCOUNT_LSKEY);
+  }
 
   const EXCELJS_URL = 'https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js';
   const FX_BASE_URL = 'https://open.er-api.com/v6/latest/USD';
@@ -346,8 +363,11 @@
     set('expense_line[audit_status_id]', line.audit_status_id ?? '');
     set('expense_line[reason]', line.reason ?? '');
     set('expense_line[amount_to_receive]', line.amount_to_receive ?? '');
-    set('expense_line[account_id]', DEFAULT_ACCOUNT.account_id);
-    set('expense_line[account_type_id]', DEFAULT_ACCOUNT.account_type_id);
+    {
+      const _aa = getActiveAccount();
+      set('expense_line[account_id]', _aa.account_id);
+      set('expense_line[account_type_id]', _aa.account_type_id);
+    }
     set('expense_line[merchant]', line.merchant ?? '');
     set('expense_line[local_expense_date]', line.local_expense_date ?? '');
     set('expense_line[parent_expense_line_id]', line.parent_expense_line_id ?? '');
@@ -420,7 +440,7 @@
 
       const needsUpdate = allLines.filter(l => {
         const accounts = Array.isArray(l.accounts) ? l.accounts : [];
-        return !accounts.some(a => Number(a.account_id) === DEFAULT_ACCOUNT.account_id);
+        return !accounts.some(a => Number(a.account_id) === Number(getActiveAccount().account_id));
       });
       skipped = allLines.length - needsUpdate.length;
       const total = needsUpdate.length;
@@ -1327,6 +1347,177 @@
     }
   }
 
+  // ---------- account selector ----------
+  function refreshAccountDisplay(panel) {
+    const a = getActiveAccount();
+    const nameEl = panel.querySelector('.__rf_acct_name');
+    const codeEl = panel.querySelector('.__rf_acct_code');
+    if (nameEl) nameEl.textContent = a.display_name || `(account ${a.account_id})`;
+    if (codeEl) codeEl.textContent = `id ${a.account_id}` + (a.code ? ` · ${a.code}` : '');
+  }
+
+  // Best-effort autocomplete against Coupa. Different tenants expose the dropdown
+  // through different endpoints; we probe a few and use whichever returns JSON.
+  let _knownAcctSearchUrl = null;
+  async function searchAccountsCoupa(term) {
+    if (!term || String(term).trim().length < 2) return [];
+    const enc = encodeURIComponent(term);
+    const candidates = _knownAcctSearchUrl
+      ? [_knownAcctSearchUrl.replace('__TERM__', enc)]
+      : [
+          `/accounts.json?term=${enc}`,
+          `/accounts/autocomplete?term=${enc}`,
+          `/accounts/search.json?q=${enc}`,
+          `/accounts/lookup?term=${enc}`,
+          `/accounts/search?term=${enc}`,
+        ];
+    for (const url of candidates) {
+      try {
+        const r = await fetch(url, { credentials: 'include', headers: { Accept: 'application/json', 'X-Requested-With': 'XMLHttpRequest' } });
+        if (!r.ok) continue;
+        const txt = await r.text();
+        let j; try { j = JSON.parse(txt); } catch { continue; }
+        const list = Array.isArray(j) ? j : (Array.isArray(j.results) ? j.results : null);
+        if (Array.isArray(list) && list.length && (list[0].id != null || list[0].account_id != null)) {
+          if (!_knownAcctSearchUrl) _knownAcctSearchUrl = url.replace(enc, '__TERM__');
+          return list.map(x => ({
+            id: x.id || x.account_id,
+            account_type_id: x.account_type_id,
+            name: x.name || x.display_name || x.label,
+            code: x.code || x.account_code,
+          })).filter(x => x.id);
+        }
+      } catch {}
+    }
+    return [];
+  }
+
+  async function fetchAccountById(id) {
+    const idNum = Number(id);
+    if (!isFinite(idNum) || idNum <= 0) return null;
+    const candidates = [
+      `/accounts/${idNum}.json`,
+      `/accounts/${idNum}`,
+    ];
+    for (const url of candidates) {
+      try {
+        const r = await fetch(url, { credentials: 'include', headers: { Accept: 'application/json', 'X-Requested-With': 'XMLHttpRequest' } });
+        if (!r.ok) continue;
+        const txt = await r.text();
+        let j; try { j = JSON.parse(txt); } catch { continue; }
+        if (j && (j.id != null || j.account_id != null)) {
+          return {
+            id: j.id || j.account_id,
+            account_type_id: j.account_type_id,
+            name: j.name,
+            code: j.code,
+          };
+        }
+      } catch {}
+    }
+    return null;
+  }
+
+  function showAccountEditor(panel) {
+    if (document.getElementById('__rf_acct_modal')) return;
+    const overlay = document.createElement('div');
+    overlay.id = '__rf_acct_modal';
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:100002;display:flex;align-items:center;justify-content:center;font:13px sans-serif;color:#222;';
+    const cur = getActiveAccount();
+    overlay.innerHTML = `
+      <div style="background:#fff;padding:20px 24px;border-radius:8px;min-width:520px;max-width:92vw;max-height:80vh;overflow:auto;box-shadow:0 6px 22px rgba(0,0,0,0.3);">
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;">
+          <h2 style="margin:0;color:#06c;">Pick an account</h2>
+          <button class="__rf_acct_modal_close" type="button" style="background:transparent;border:none;color:#888;font-size:22px;cursor:pointer;line-height:1;padding:0;">&times;</button>
+        </div>
+        <div style="margin:6px 0 14px 0;color:#666;font-size:12px;">Currently set: <b>${escapeHtml(cur.display_name || `(id ${cur.account_id})`)}</b> <span style="color:#888;">id ${cur.account_id}</span></div>
+
+        <div style="margin-bottom:14px;">
+          <label style="display:block;font-weight:bold;margin-bottom:4px;">Search by name or code</label>
+          <input class="__rf_acct_search" type="text" placeholder="type to search…" style="width:100%;padding:6px 8px;border:1px solid #aaa;border-radius:3px;box-sizing:border-box;">
+          <div class="__rf_acct_results" style="margin-top:6px;max-height:240px;overflow:auto;border:1px solid #ddd;border-radius:3px;display:none;"></div>
+          <div class="__rf_acct_search_status" style="font-size:11px;color:#888;margin-top:4px;"></div>
+        </div>
+
+        <div style="margin-bottom:14px;border-top:1px solid #eee;padding-top:14px;">
+          <label style="display:block;font-weight:bold;margin-bottom:4px;">Or paste an Account ID</label>
+          <div style="display:flex;gap:6px;">
+            <input class="__rf_acct_id" type="number" placeholder="e.g. 6222" style="flex:1;padding:6px 8px;border:1px solid #aaa;border-radius:3px;">
+            <button class="__rf_acct_use_id" type="button" style="padding:6px 14px;border:1px solid #048;background:#06c;color:#fff;border-radius:3px;cursor:pointer;">Use ID</button>
+          </div>
+        </div>
+
+        <div style="text-align:right;border-top:1px solid #eee;padding-top:12px;">
+          <button class="__rf_acct_modal_cancel" type="button" style="padding:6px 14px;border:1px solid #ccc;background:#fff;border-radius:3px;cursor:pointer;">Cancel</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    const close = () => overlay.remove();
+    overlay.querySelector('.__rf_acct_modal_close').addEventListener('click', close);
+    overlay.querySelector('.__rf_acct_modal_cancel').addEventListener('click', close);
+    overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+
+    const searchInput = overlay.querySelector('.__rf_acct_search');
+    const resultsBox = overlay.querySelector('.__rf_acct_results');
+    const searchStatus = overlay.querySelector('.__rf_acct_search_status');
+    let deb = null;
+    searchInput.addEventListener('input', () => {
+      clearTimeout(deb);
+      const term = searchInput.value;
+      if (!term || term.trim().length < 2) {
+        resultsBox.style.display = 'none';
+        searchStatus.textContent = '';
+        return;
+      }
+      searchStatus.textContent = 'searching…';
+      deb = setTimeout(async () => {
+        const list = await searchAccountsCoupa(term);
+        if (!list.length) {
+          resultsBox.style.display = 'none';
+          searchStatus.textContent = `No results (Coupa search endpoint may not be available — paste the Account ID below instead).`;
+          return;
+        }
+        searchStatus.textContent = `${list.length} result(s)`;
+        resultsBox.innerHTML = list.slice(0, 50).map(r => {
+          return `<div class="__rf_acct_result_row" data-id="${r.id}" data-name="${escapeHtml(r.name || '')}" data-code="${escapeHtml(r.code || '')}" data-type="${r.account_type_id || ''}" style="padding:6px 8px;border-bottom:1px solid #eee;cursor:pointer;">
+            <div style="font-weight:bold;">${escapeHtml(r.name || '(unnamed)')}</div>
+            <div style="font-size:11px;color:#888;">id ${r.id}${r.code ? ' · ' + escapeHtml(r.code) : ''}</div>
+          </div>`;
+        }).join('');
+        resultsBox.style.display = 'block';
+      }, 280);
+    });
+    resultsBox.addEventListener('click', e => {
+      const row = e.target.closest('.__rf_acct_result_row');
+      if (!row) return;
+      const id = Number(row.dataset.id);
+      const name = row.dataset.name;
+      const code = row.dataset.code;
+      const account_type_id = Number(row.dataset.type) || cur.account_type_id || DEFAULT_ACCOUNT.account_type_id;
+      setActiveAccount({ account_id: id, account_type_id, display_name: name, code });
+      refreshAccountDisplay(panel);
+      close();
+    });
+
+    overlay.querySelector('.__rf_acct_use_id').addEventListener('click', async () => {
+      const idStr = overlay.querySelector('.__rf_acct_id').value;
+      const id = Number(idStr);
+      if (!isFinite(id) || id <= 0) { alert('Enter a positive numeric Account ID.'); return; }
+      searchStatus.textContent = `Looking up id ${id}…`;
+      const acct = await fetchAccountById(id);
+      const next = {
+        account_id: id,
+        account_type_id: (acct && acct.account_type_id) || cur.account_type_id || DEFAULT_ACCOUNT.account_type_id,
+        display_name: (acct && acct.name) || `(account ${id})`,
+        code: (acct && acct.code) || '',
+      };
+      setActiveAccount(next);
+      refreshAccountDisplay(panel);
+      close();
+    });
+  }
+
   // ---------- help modal ----------
   function showHelpModal() {
     if (document.getElementById('__rf_help_modal')) return;
@@ -1342,7 +1533,8 @@
         <p style="margin:6px 0 14px 0;color:#666;">A Tampermonkey userscript that bulk-edits Coupa expense reports. Lives at top-right of any Coupa <code>/expenses*</code> page and operates only on <b>draft</b> reports.</p>
         <h3 style="margin:14px 0 4px 0;color:#222;">Buttons</h3>
         <ul style="margin:0 0 0 18px;padding:0;line-height:1.55;">
-          <li><b>Apply Account to All</b> — PATCHes every draft line whose <code>accounts[]</code> doesn't already include the configured account (id <code>${DEFAULT_ACCOUNT.account_id}</code>, ${escapeHtml(DEFAULT_ACCOUNT.display_name)}). Skips lines that are already set, so re-running is safe and fast.</li>
+          <li><b>Apply Account to All</b> — PATCHes every draft line whose <code>accounts[]</code> doesn't already include the configured account (currently id <code>${getActiveAccount().account_id}</code>, ${escapeHtml(getActiveAccount().display_name)}). Skips lines that are already set, so re-running is safe and fast.</li>
+          <li><b>Account selector</b> — type to search Coupa accounts (uses Coupa's own autocomplete). The ↺ button reverts to the script default (id <code>${DEFAULT_ACCOUNT.account_id}</code>, ${escapeHtml(DEFAULT_ACCOUNT.display_name)}). The selection is stored in your browser's localStorage and reused by Apply Account to All + the Upload &amp; Apply pipeline.</li>
           <li><b>Match Receipts</b> — scans the wallet sidebar (<code>li.walletLine</code>) and pairs receipts to draft lines that don't yet have one. Tiers (highest score wins): exact same currency + amount → ±1% same currency + ≥1 token of merchant overlap → cross-currency within ±12% USD-equivalent + token overlap. Posts <code>/expenses/wallet/merge_receipt_to_expense_line</code> per match. Confirms the first match before applying the rest.</li>
           <li><b>Download Non-Compliant</b> — generates an .xlsx of every draft line with at least one problem: missing receipt &gt; $25 USD-eq, missing account, missing category, or gift-meal whose value-per-attendee &gt; $25. Editable columns get <span style="background:#C8E6C9;padding:0 4px;">green headers</span>. Invalid cells light <span style="background:#FF6B6B;color:#fff;padding:0 4px;">red</span> (live conditional formatting).</li>
           <li><b>Export All</b> — same xlsx structure but includes every draft line, not just non-compliant ones. Useful for a complete audit pass.</li>
@@ -1414,7 +1606,7 @@
       </div>
       <button class="__rf_apply_account_btn" type="button" style="background:#06c;color:#fff;border:1px solid #048;padding:5px 8px;border-radius:3px;cursor:pointer;width:100%;white-space:nowrap;">Apply Account to All</button>
       <button class="__rf_match_btn" type="button" style="margin-top:5px;background:#06c;color:#fff;border:1px solid #048;padding:5px 8px;border-radius:3px;cursor:pointer;width:100%;white-space:nowrap;">Match Receipts</button>
-      <button class="__rf_download_problems_btn" type="button" style="margin-top:5px;background:#fff;color:#06c;border:1px solid #06c;padding:5px 8px;border-radius:3px;cursor:pointer;width:100%;white-space:nowrap;">Download Non-Compliant</button>
+      <button class="__rf_download_problems_btn" type="button" style="margin-top:5px;background:#fff;color:#06c;border:1px solid #06c;padding:5px 8px;border-radius:3px;cursor:pointer;width:100%;white-space:nowrap;">Export Non-Compliant</button>
       <button class="__rf_export_all_btn" type="button" style="margin-top:5px;background:#fff;color:#06c;border:1px solid #06c;padding:5px 8px;border-radius:3px;cursor:pointer;width:100%;white-space:nowrap;">Export All</button>
       <button class="__rf_upload_btn" type="button" style="margin-top:5px;background:#fff;color:#06c;border:1px solid #06c;padding:5px 8px;border-radius:3px;cursor:pointer;width:100%;white-space:nowrap;">Upload &amp; Apply</button>
       <input class="__rf_upload_file" type="file" accept=".xlsx" style="display:none;">
@@ -1422,9 +1614,14 @@
         <div class="__rf_progress_bar" style="height:100%;width:0%;background:#06c;transition:width 200ms ease;"></div>
       </div>
       <div class="__rf_progress_text" style="display:none;margin-top:3px;font-size:10px;color:#06c;text-align:center;font-variant-numeric:tabular-nums;"></div>
-      <div style="margin-top:6px;font-size:11px;line-height:1.3;word-break:break-word;">
-        <b>Account:</b> ${DEFAULT_ACCOUNT.display_name}<br>
-        <span style="color:#888;">id ${DEFAULT_ACCOUNT.account_id} &middot; ${DEFAULT_ACCOUNT.code}</span>
+      <div class="__rf_acct_block" style="margin-top:6px;font-size:11px;line-height:1.3;word-break:break-word;">
+        <div style="display:flex;align-items:center;gap:4px;">
+          <b style="flex:0 0 auto;">Account:</b>
+          <button class="__rf_acct_edit" type="button" title="Pick a different account" style="flex:0 0 auto;background:transparent;border:none;cursor:pointer;color:#06c;font-size:11px;padding:0;">&#9998;</button>
+          <button class="__rf_acct_reset" type="button" title="Revert to script default" style="flex:0 0 auto;background:transparent;border:none;cursor:pointer;color:#888;font-size:13px;padding:0;">&#x21BA;</button>
+        </div>
+        <div class="__rf_acct_name" style="margin-top:2px;"></div>
+        <div class="__rf_acct_code" style="color:#888;"></div>
       </div>
       <div class="__rf_acct_status" style="margin-top:6px;font-size:11px;color:#06c;min-height:14px;word-break:break-word;"></div>
     `;
@@ -1439,7 +1636,7 @@
         status.textContent = 'No draft reports found. Are you signed in to Coupa expenses?';
         return;
       }
-      if (!confirm(`Apply account ${DEFAULT_ACCOUNT.account_id} (${DEFAULT_ACCOUNT.display_name}) to every line in ${draftIds.length} draft reports?\n\nLines that already have this account will be skipped.\n\nThis is a bulk PATCH that may take several minutes.`)) {
+      if (!confirm(`Apply account ${getActiveAccount().account_id} (${getActiveAccount().display_name}) to every line in ${draftIds.length} draft reports?\n\nLines that already have this account will be skipped.\n\nThis is a bulk PATCH that may take several minutes.`)) {
         status.textContent = 'cancelled';
         return;
       }
@@ -1480,6 +1677,17 @@
     });
     // Help (?)
     panel.querySelector('.__rf_panel_help').addEventListener('click', () => showHelpModal());
+
+    // Account editor (✎)
+    panel.querySelector('.__rf_acct_edit').addEventListener('click', () => showAccountEditor(panel));
+    // Account reset (↺)
+    panel.querySelector('.__rf_acct_reset').addEventListener('click', () => {
+      if (!confirm(`Reset account to script default?\n\n${DEFAULT_ACCOUNT.display_name} (id ${DEFAULT_ACCOUNT.account_id})`)) return;
+      resetActiveAccount();
+      refreshAccountDisplay(panel);
+    });
+    // Initial render of the account display
+    refreshAccountDisplay(panel);
 
     // Upload + Apply
     const fileInput = panel.querySelector('.__rf_upload_file');
