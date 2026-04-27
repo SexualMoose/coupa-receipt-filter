@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Coupa Receipt Filter (Attach Receipt dialog, ±% across currencies)
 // @namespace    local.tylerkeller
-// @version      0.6.1
+// @version      0.6.2
 // @description  Filter the Coupa "Attach a receipt" dialog by ±X%, plus a top-right panel with Apply-Account-to-All, Download-Problems (xlsx with red/yellow row highlights AND conditional formatting on invalid entries), and Upload-and-Apply (description + attendee bulk edit with first-line confirmation + progress bar).
 // @match        https://*.coupahost.com/*
 // @run-at       document-idle
@@ -710,9 +710,12 @@
     ash.views = [{ state: 'frozen', ySplit: 1 }];
     [10, 10, 22, 22].forEach((w, i) => { ash.getColumn(i + 1).width = w; });
     attendees.forEach(a => ash.addRow([a.id, a.type_id || NEW_ATTENDEE_TYPE_ID, a.first_name, a.last_name]));
-    const noteRow = ash.addRow(['', '', '', '']);
-    noteRow.getCell(1).value = 'To add a NEW attendee: append a row with id BLANK, leave type_id blank (defaults to 6), set first_name and last_name. Use "first last" as a column header on the Lines sheet to mark X.';
-    noteRow.getCell(1).font = { italic: true, color: { argb: 'FF888888' } };
+    // Attach instructions as a header-cell comment so it doesn't pollute the data area.
+    try {
+      ash.getCell('A1').note = {
+        texts: [{ text: 'To add a NEW attendee: append a row with id BLANK, type_id blank (defaults to 6), set first_name and last_name. Then add a column header "first last" on the Lines sheet to mark X.' }],
+      };
+    } catch (e) { /* fall back: no comment */ }
 
     // (No conditional formatting on Attendees sheet — user requested no red anywhere
     // except per-cell on Lines new_category and attendee columns.)
@@ -750,7 +753,9 @@
       const type_id = row.getCell(2).value;
       const first_name = row.getCell(3).value;
       const last_name = row.getCell(4).value;
-      if (!first_name && !last_name && !id) return;
+      // Skip rows that have neither first_name nor last_name — these are not real
+      // attendee rows even if some other column got typed into accidentally.
+      if (!first_name && !last_name) return;
       // id must be numeric or empty
       if (id != null && id !== '' && isNaN(Number(id))) {
         validationErrors.push(`Attendees!A${idx}: id "${id}" is not numeric`);
