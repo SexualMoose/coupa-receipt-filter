@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Coupa Receipt Filter (Attach Receipt dialog, ±% across currencies)
 // @namespace    local.tylerkeller
-// @version      0.3.1
-// @description  When the Coupa "Attach a receipt" dialog opens, filter receipts to those within ±X% of the expense line's Total Amount (converted to USD/EUR/COP/SGD/TRY). Displays merchant, date, and total on the filter bar. Shrinks the dialog body so the Attach/Cancel buttons remain visible.
+// @version      0.4.0
+// @description  Filter the Coupa "Attach a receipt" dialog to receipts within ±X% of the expense line's Total Amount (USD/EUR/COP/SGD/TRY). Also adds an "Apply Account to All" button that PATCHes every draft expense line with a configured account.
 // @match        https://*.coupahost.com/*
 // @run-at       document-idle
 // @grant        GM_xmlhttpRequest
@@ -13,6 +13,14 @@
   'use strict';
 
   // ---------- config ----------
+  // Default account to bulk-apply via the toolbar button.
+  // Capture these values from your tenant by clicking "Choose" on a representative
+  // line and watching POST /accounts/select_dynamic_account in DevTools Network.
+  const DEFAULT_ACCOUNT = {
+    account_id: 6222,        // returned id from /accounts/select_dynamic_account
+    account_type_id: 4,       // US1
+  };
+
   const TARGETS = ['USD', 'EUR', 'COP', 'SGD', 'TRY'];
   const DEFAULT_TOL_PCT = 5;
   const FX_URL = 'https://open.er-api.com/v6/latest/USD';
@@ -111,10 +119,13 @@
         <label><input class="__rf_auto" type="checkbox" checked> auto</label>
         <button class="__rf_clear" type="button">Show all</button>
         <button class="__rf_fx" type="button" title="Refetch FX">&#8635; FX</button>
+        <span style="border-left:1px solid #c69; margin:0 4px; height:18px;"></span>
+        <button class="__rf_apply_account" type="button" title="PATCH every line in every draft report with the configured account" style="background:#06c;color:#fff;border:1px solid #048;padding:3px 8px;border-radius:3px;">Apply Account to All</button>
       </div>
       <div class="__rf_meta" style="margin-top:6px;color:#222;"></div>
       <div class="__rf_targets" style="margin-top:4px;color:#444;"></div>
       <div class="__rf_status" style="margin-top:4px;color:#555;"></div>
+      <div class="__rf_acct_status" style="margin-top:4px;color:#06c;"></div>
     `;
 
     // Insert bar at top of dialog
@@ -217,6 +228,23 @@
       fxCache = null;
       await refresh();
     });
+    $('.__rf_apply_account').addEventListener('click', async () => {
+      if (window.__rfAcctRunning) {
+        $('.__rf_acct_status').textContent = 'Already running…';
+        return;
+      }
+      const draftReportIds = (window.ExpenseReports || [])
+        .filter(r => r.status === 'draft')
+        .map(r => r.id);
+      if (!draftReportIds.length) {
+        $('.__rf_acct_status').textContent = 'No draft reports found in this page.';
+        return;
+      }
+      if (!confirm(`Apply account ${DEFAULT_ACCOUNT.account_id} to every line in ${draftReportIds.length} draft reports?\n\nThis is a bulk PATCH that may take several minutes.`)) {
+        return;
+      }
+      runApplyAccountToAll(draftReportIds, $('.__rf_acct_status'));
+    });
 
     // Re-apply when new receipts get added/removed inside the dialog (e.g., infinite scroll)
     const list = dialog.querySelector('ul') || dialog;
@@ -228,6 +256,109 @@
 
     // Initial apply
     refresh();
+  }
+
+  // ---------- bulk account-apply ----------
+  function fetchReportLines(reportId) {
+    return fetch(`/expense_reports/${reportId}/edit`, { credentials: 'include' })
+      .then(r => r.text())
+      .then(html => {
+        const start = html.search(/var\s+ExpenseReports\s*=\s*\[/);
+        if (start < 0) return null;
+        const arrStart = html.indexOf('[', start);
+        let depth = 0, i = arrStart, inStr = false, strCh = '', esc = false;
+        for (; i < html.length; i++) {
+          const c = html[i];
+          if (inStr) { if (esc) esc = false; else if (c === '\\') esc = true; else if (c === strCh) inStr = false; }
+          else { if (c === '"' || c === '\'') { inStr = true; strCh = c; } else if (c === '[') depth++; else if (c === ']') { depth--; if (depth === 0) { i++; break; } } }
+        }
+        return JSON.parse(html.slice(arrStart, i)).find(p => p.id === reportId);
+      });
+  }
+
+  function buildAccountPatchBody(line) {
+    const u = new URLSearchParams();
+    const set = (k, v) => u.append(k, v == null ? '' : String(v));
+    set('expense_line[custom_field_3]', line.custom_field_3 ?? '');
+    set('expense_line[travel_provider_type]', line.travel_provider_type ?? '');
+    set('expense_line[audit_status_id]', line.audit_status_id ?? '');
+    set('expense_line[reason]', line.reason ?? '');
+    set('expense_line[amount_to_receive]', line.amount_to_receive ?? '');
+    set('expense_line[account_id]', DEFAULT_ACCOUNT.account_id);
+    set('expense_line[account_type_id]', DEFAULT_ACCOUNT.account_type_id);
+    set('expense_line[merchant]', line.merchant ?? '');
+    set('expense_line[local_expense_date]', line.local_expense_date ?? '');
+    set('expense_line[parent_expense_line_id]', line.parent_expense_line_id ?? '');
+    set('expense_line[start_date]', line.start_date ?? line.local_expense_date ?? '');
+    set('expense_line[end_date]', line.end_date ?? line.local_expense_date ?? '');
+    set('expense_line[travel_provider_name]', line.travel_provider_name ?? '');
+    set('expense_line[expense_category_id]', line.expense_category_id ?? '');
+    set('expense_line[employee_reimbursable]', line.employee_reimbursable ? 'true' : 'false');
+    set('expense_line[expense_category_custom_field_1]', line.expense_category_custom_field_1 ?? '');
+    set('expense_line[receipt_total_currency_id]', line.receipt_currency?.id ?? '');
+    set('expense_line[foreign_currency_id]', line.amount_to_receive_currency?.id ?? '');
+    set('expense_line[external_src_name]', line.external_src_name ?? '');
+    set('expense_line[exchange_rate]', line.exchange_rate ?? '');
+    set('expense_line[description]', line.description ?? '');
+    set('expense_line[employee_reimbursable_overridden]', line.employee_reimbursable_overridden ? 'true' : 'false');
+    set('expense_line[divisor]', line.divisor ?? '');
+    set('expense_line[receipt_total_amount]', line.receipt_amount ?? '');
+    set('expense_line[foreign_currency_amount]', line.amount_to_receive ?? '');
+    set('expense_line[expense_report_id]', line.expense_report_id ?? '');
+    set('expense_line[custom_field_2]', line.custom_field_2 ? 'true' : 'false');
+    (line.expense_attendees || []).forEach(a => u.append('expense_line[attendee_ids][]', a.id));
+    return u.toString();
+  }
+
+  async function runApplyAccountToAll(reportIds, statusEl) {
+    window.__rfAcctRunning = true;
+    const csrf = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content');
+    const headers = {
+      'Accept': 'application/json, text/plain, */*',
+      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+      'X-CSRF-Token': csrf,
+      'X-Requested-With': 'XMLHttpRequest',
+    };
+    let ok = 0, fail = 0, skipped = 0, total = 0;
+    const failures = [];
+    statusEl.textContent = 'Fetching reports…';
+
+    const allLines = [];
+    for (const rid of reportIds) {
+      try {
+        const rpt = await fetchReportLines(rid);
+        if (rpt && Array.isArray(rpt.expense_lines)) {
+          for (const l of rpt.expense_lines) allLines.push(l);
+        }
+      } catch (e) {
+        failures.push({ report_id: rid, error: 'fetch failed: ' + String(e).slice(0, 100) });
+      }
+    }
+    total = allLines.length;
+    statusEl.textContent = `Patching 0/${total}…`;
+
+    for (const line of allLines) {
+      try {
+        const r = await fetch(`/expenses/expense_lines/${line.id}`, {
+          method: 'PATCH',
+          credentials: 'include',
+          headers,
+          body: buildAccountPatchBody(line),
+        });
+        if (r.ok) ok++;
+        else { fail++; const txt = await r.text(); failures.push({ line_id: line.id, status: r.status, head: txt.slice(0, 200) }); }
+      } catch (e) {
+        fail++; failures.push({ line_id: line.id, error: String(e).slice(0, 200) });
+      }
+      const done = ok + fail;
+      if (done % 5 === 0 || done === total) {
+        statusEl.textContent = `${done}/${total} ok=${ok} fail=${fail}`;
+      }
+      await new Promise(r => setTimeout(r, 120));
+    }
+    window.__rfAcctRunning = false;
+    statusEl.innerHTML = `<b>Account apply complete.</b> ok=${ok} / fail=${fail}` +
+      (failures.length ? ` <a href="data:application/json;base64,${btoa(JSON.stringify(failures, null, 2))}" download="account-apply-failures.json" style="color:#06c;">download failures</a>` : '');
   }
 
   // ---------- dialog watcher ----------
