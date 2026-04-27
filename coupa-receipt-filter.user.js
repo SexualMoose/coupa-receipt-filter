@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Coupa Receipt Filter (Attach Receipt dialog, ±% across currencies)
 // @namespace    local.tylerkeller
-// @version      0.6.3
+// @version      0.6.4
 // @description  Filter the Coupa "Attach a receipt" dialog by ±X%, plus a top-right panel with Apply-Account-to-All, Download-Problems (xlsx with red/yellow row highlights AND conditional formatting on invalid entries), and Upload-and-Apply (description + attendee bulk edit with first-line confirmation + progress bar).
 // @match        https://*.coupahost.com/*
 // @run-at       document-idle
@@ -1076,11 +1076,14 @@
         return;
       }
 
-      // Apply the rest
+      // Apply the rest. Counters align across loop, progress bar, and final tally:
+      //   okCount starts at 1 because the first line was already PATCHed successfully.
+      //   The progress bar denominator is realChanges.length (includes the first line).
       const rest = realChanges.slice(1);
-      setProgress(0, rest.length);
-      let okCount = 0, failCount = 0;
+      const totalToApply = realChanges.length;
+      let okCount = 1, failCount = 0;
       const failures = [];
+      setProgress(okCount + failCount, totalToApply);
       for (let i = 0; i < rest.length; i++) {
         const ch = rest[i];
         const line = await findLineById(reports, ch.line_id);
@@ -1092,12 +1095,12 @@
             else { failCount++; failures.push({ line_id: ch.line_id, status: resp.status, head: (await resp.text()).slice(0, 200) }); }
           } catch (e) { failCount++; failures.push({ line_id: ch.line_id, error: String(e).slice(0, 200) }); }
         }
-        setProgress(i + 1, rest.length);
-        status.textContent = `ok=${okCount + 1} fail=${failCount} skipped=${skippedNoOp.length}`;
+        setProgress(okCount + failCount, totalToApply);
+        status.textContent = `ok=${okCount} fail=${failCount} skipped=${skippedNoOp.length}`;
         await new Promise(r => setTimeout(r, 120));
       }
 
-      status.innerHTML = `<b>Done.</b> ok=${okCount + 1} / fail=${failCount} / no-op skipped=${skippedNoOp.length}` +
+      status.innerHTML = `<b>Done.</b> ok=${okCount} / fail=${failCount} / no-op skipped=${skippedNoOp.length}` +
         (failures.length ? ` <a href="data:application/json;base64,${btoa(JSON.stringify(failures, null, 2))}" download="upload-apply-failures.json" style="color:#06c;">download failures</a>` : '');
       progressBar.style.background = failCount > 0 ? '#c60' : '#0a7';
     } catch (e) {
