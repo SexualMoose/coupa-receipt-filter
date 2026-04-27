@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Coupa Receipt Filter (Attach Receipt dialog, ±% across currencies)
 // @namespace    local.tylerkeller
-// @version      0.5.2
+// @version      0.6.0
 // @description  Filter the Coupa "Attach a receipt" dialog by ±X%, plus a top-right panel with Apply-Account-to-All, Download-Problems (xlsx with red/yellow row highlights AND conditional formatting on invalid entries), and Upload-and-Apply (description + attendee bulk edit with first-line confirmation + progress bar).
 // @match        https://*.coupahost.com/*
 // @run-at       document-idle
@@ -549,27 +549,63 @@
     }
   }
 
+  // Sweep distinct expense categories actually used on draft lines, with their IDs.
+  function collectUsedCategories(reports) {
+    const map = new Map();
+    reports.forEach(r => (r.expense_lines || []).forEach(l => {
+      if (l.expense_category_id && l.expense_category_name) {
+        map.set(l.expense_category_name, l.expense_category_id);
+      }
+    }));
+    return Array.from(map.entries())
+      .map(([name, id]) => ({ name, id }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
   async function _buildWorkbookInner(ExcelJS, reports, usdRates, status, panel) {
 
     const attendees = collectAttendeeDirectory(reports);
+    const usedCategories = collectUsedCategories(reports);
     const RED = 'FFFFC7CE';      // light red
     const YELLOW = 'FFFFEB9C';    // light yellow
     const ORANGE = 'FFFFD699';    // light orange (red+yellow)
+    const GREEN_HDR = 'FFC8E6C9'; // light green for editable column headers
 
     const wb = new ExcelJS.Workbook();
+
+    // Hidden helper sheet with valid category names (used by CF formula on Lines).
+    const catSh = wb.addWorksheet('_categories', { state: 'veryHidden' });
+    catSh.addRow(['name', 'id']);
+    usedCategories.forEach(c => catSh.addRow([c.name, c.id]));
+
     const sh = wb.addWorksheet('Lines');
+    // Column order:
+    // A line_id, B report_title, C merchant, D date, E amount, F currency, G usd_eq,
+    // H current_category, I new_category (EDITABLE+dropdown),
+    // J problems, K current_description, L new_description (EDITABLE),
+    // M current_attendees, N+ attendee columns (EDITABLE)
     const headers = [
       'line_id', 'report_title', 'merchant', 'date', 'amount', 'currency', 'usd_eq',
-      'category', 'problems', 'current_description', 'new_description',
+      'current_category', 'new_category',
+      'problems', 'current_description', 'new_description',
       'current_attendees',
     ].concat(attendees.map(a => `${a.first_name} ${a.last_name} (${a.id})`));
     sh.addRow(headers);
     sh.getRow(1).font = { bold: true };
     sh.views = [{ state: 'frozen', ySplit: 1, xSplit: 4 }];
-    [10, 32, 28, 10, 10, 7, 10, 28, 26, 24, 28, 30].forEach((w, i) => {
+    [10, 32, 28, 10, 10, 7, 10, 24, 24, 28, 26, 28, 30].forEach((w, i) => {
       sh.getColumn(i + 1).width = w;
     });
-    for (let i = 13; i <= headers.length; i++) sh.getColumn(i).width = 8;
+    const ATTENDEE_COL_START = 14; // column N
+    for (let i = ATTENDEE_COL_START; i <= headers.length; i++) sh.getColumn(i).width = 8;
+
+    // Green headers on editable columns: I (new_category), L (new_description), N..end (attendees)
+    const editableHeaderCols = [9, 12]; // I, L
+    for (let c = ATTENDEE_COL_START; c <= headers.length; c++) editableHeaderCols.push(c);
+    editableHeaderCols.forEach(c => {
+      const cell = sh.getRow(1).getCell(c);
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: GREEN_HDR } };
+    });
 
     let problemRows = 0;
     reports.forEach(rpt => {
@@ -585,6 +621,7 @@
           (l.receipt_currency?.code || '').toUpperCase(),
           isFinite(usdEq) ? Number(usdEq.toFixed(2)) : '',
           l.expense_category_name || '',
+          '', // new_category (editable, blank by default)
           problems.join(', '),
           l.description || '',
           '',
@@ -604,17 +641,53 @@
       });
     });
 
-    // Conditional formatting on Lines: red-fill any cell in attendee columns that
-    // is non-empty AND not "x"/"X". Wrapped in try/catch so a CF API mismatch doesn't
-    // sink the whole download.
+    // ----- Data validation for new_category dropdown (col I) -----
+    // Excel inline dropdown limit is ~255 chars when using a literal list; for safety,
+    // reference the hidden _categories sheet's range instead.
+    try {
+      const catRows = usedCategories.length;
+      if (catRows > 0) {
+        const lastDataRow = Math.max(2, problemRows + 1);
+        for (let r = 2; r <= lastDataRow; r++) {
+          sh.getCell(`I${r}`).dataValidation = {
+            type: 'list',
+            allowBlank: true,
+            formulae: [`_categories!$A$2:$A$${catRows + 1}`],
+            showErrorMessage: true,
+            errorStyle: 'error',
+            errorTitle: 'Invalid category',
+            error: 'Use the dropdown to pick a valid category. Leave blank to keep current.',
+          };
+        }
+      }
+    } catch (e) { console.warn('[CoupaReceiptFilter] new_category dropdown skipped:', e); }
+
+    // ----- Conditional formatting on Lines -----
+    // Red on:
+    //   - new_category (I): non-empty AND not present in _categories!A:A
+    //   - any attendee column (N+): non-empty AND not "x"/"X"
     try {
       const colLetter = (n) => {
         let s = '';
         while (n > 0) { const r = (n - 1) % 26; s = String.fromCharCode(65 + r) + s; n = Math.floor((n - 1) / 26); }
         return s;
       };
-      if (headers.length >= 13) {
-        const attCol1Letter = colLetter(13);
+      // CF: new_category invalid (referencing helper sheet)
+      sh.addConditionalFormatting({
+        ref: 'I2:I10000',
+        rules: [{
+          type: 'expression',
+          priority: 1,
+          formulae: ['AND(LEN(I2)>0, COUNTIF(_categories!$A:$A, I2)=0)'],
+          style: {
+            fill: { type: 'pattern', pattern: 'solid', bgColor: { argb: 'FFFF6B6B' } },
+            font: { color: { argb: 'FFFFFFFF' }, bold: true },
+          },
+        }],
+      });
+      // CF: attendee columns invalid
+      if (headers.length >= ATTENDEE_COL_START) {
+        const attCol1Letter = colLetter(ATTENDEE_COL_START);
         const attColLastLetter = colLetter(headers.length);
         const refRange = `${attCol1Letter}2:${attColLastLetter}10000`;
         sh.addConditionalFormatting({
@@ -739,9 +812,23 @@
     const colIdx = (name) => headers.findIndex(h => String(h).trim() === name) + 1;
     const COL_LINE_ID = colIdx('line_id');
     const COL_NEW_DESC = colIdx('new_description');
+    const COL_NEW_CAT = colIdx('new_category');
     if (!COL_LINE_ID || !COL_NEW_DESC) throw new Error('Required columns not found.');
     // Attendee columns are anything after current_attendees
     const attendeeColStart = colIdx('current_attendees') + 1;
+
+    // Build category-name -> id map by reading the hidden _categories helper sheet
+    // (or fall back to whatever is on the report data if the helper sheet was stripped).
+    const categoryNameToId = new Map();
+    const helperSheet = wb.getWorksheet('_categories');
+    if (helperSheet) {
+      helperSheet.eachRow({ includeEmpty: false }, (row, idx) => {
+        if (idx === 1) return;
+        const name = row.getCell(1).value;
+        const id = row.getCell(2).value;
+        if (name && id) categoryNameToId.set(String(name).trim(), Number(id));
+      });
+    }
 
     const changes = [];
     const colLet = (n) => { let s = ''; while (n > 0) { const r = (n - 1) % 26; s = String.fromCharCode(65 + r) + s; n = Math.floor((n - 1) / 26); } return s; };
@@ -750,6 +837,18 @@
       const lineId = Number(row.getCell(COL_LINE_ID).value);
       if (!lineId) return;
       const newDesc = row.getCell(COL_NEW_DESC).value;
+      const newCatRaw = COL_NEW_CAT ? row.getCell(COL_NEW_CAT).value : null;
+      let newCategoryId = null;
+      let newCategoryName = null;
+      if (newCatRaw != null && String(newCatRaw).trim() !== '') {
+        const trimmed = String(newCatRaw).trim();
+        if (categoryNameToId.has(trimmed)) {
+          newCategoryId = categoryNameToId.get(trimmed);
+          newCategoryName = trimmed;
+        } else {
+          validationErrors.push(`Lines!${colLet(COL_NEW_CAT)}${idx}: new_category "${trimmed}" not in dropdown list`);
+        }
+      }
       const markedAttendees = [];
       for (let c = attendeeColStart; c <= headers.length; c++) {
         const v = row.getCell(c).value;
@@ -765,10 +864,12 @@
           validationErrors.push(`Lines!${colLet(c)}${idx}: invalid value "${sv}" (must be blank or "x")`);
         }
       }
-      if ((newDesc && String(newDesc).trim()) || markedAttendees.length) {
+      if ((newDesc && String(newDesc).trim()) || markedAttendees.length || newCategoryId) {
         changes.push({
           line_id: lineId,
           new_description: newDesc ? String(newDesc).trim() : null,
+          new_category_id: newCategoryId,
+          new_category_name: newCategoryName,
           attendees: markedAttendees,
         });
       }
@@ -837,7 +938,7 @@
     set('expense_line[start_date]', line.start_date ?? line.local_expense_date ?? '');
     set('expense_line[end_date]', line.end_date ?? line.local_expense_date ?? '');
     set('expense_line[travel_provider_name]', line.travel_provider_name ?? '');
-    set('expense_line[expense_category_id]', line.expense_category_id ?? '');
+    set('expense_line[expense_category_id]', change.new_category_id != null ? change.new_category_id : (line.expense_category_id ?? ''));
     set('expense_line[employee_reimbursable]', line.employee_reimbursable ? 'true' : 'false');
     set('expense_line[expense_category_custom_field_1]', line.expense_category_custom_field_1 ?? '');
     set('expense_line[receipt_total_currency_id]', line.receipt_currency?.id ?? '');
@@ -944,6 +1045,7 @@
       if (!r.ok) { status.textContent = `First PATCH failed (status ${r.status}). Aborting.`; return; }
       const summary =
         `<b>Line ${first.line_id}</b> &mdash; ${escapeHtml(firstLine.merchant || '')}<br>` +
+        (first.new_category_name ? `&bull; category set to: <i>${escapeHtml(first.new_category_name)}</i><br>` : '') +
         (first.new_description ? `&bull; description set to: <i>${escapeHtml(first.new_description)}</i><br>` : '') +
         (first.attendees.length ? `&bull; attendees added: ${first.attendees.map(a => escapeHtml(a.first_name + ' ' + a.last_name)).join(', ')}<br>` : '');
       const ok = await showFirstLineConfirm(panel, summary);
