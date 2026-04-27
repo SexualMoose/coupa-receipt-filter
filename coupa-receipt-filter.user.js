@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Coupa Receipt Filter (Attach Receipt dialog, ±% across currencies)
 // @namespace    local.tylerkeller
-// @version      0.6.2
+// @version      0.6.3
 // @description  Filter the Coupa "Attach a receipt" dialog by ±X%, plus a top-right panel with Apply-Account-to-All, Download-Problems (xlsx with red/yellow row highlights AND conditional formatting on invalid entries), and Upload-and-Apply (description + attendee bulk edit with first-line confirmation + progress bar).
 // @match        https://*.coupahost.com/*
 // @run-at       document-idle
@@ -1011,8 +1011,51 @@
         status.textContent = 'No changes detected in the upload.';
         return;
       }
-      // Apply the FIRST change, ask user to confirm
-      const first = changes[0];
+
+      // Filter out no-op changes by comparing the spreadsheet's intent against the
+      // line's CURRENT live state in Coupa. A "no-op" is a row whose new_description
+      // equals the existing description AND whose new_category_id matches the line's
+      // current category AND whose marked attendees are all already attached.
+      const sameStr = (a, b) => (String(a || '').trim() === String(b || '').trim());
+      const noOp = (line, ch) => {
+        if (ch.new_description != null && !sameStr(ch.new_description, line.description)) return false;
+        if (ch.new_category_id != null && Number(ch.new_category_id) !== Number(line.expense_category_id)) return false;
+        const existingIds = new Set((line.expense_attendees || []).map(a => a.id));
+        const additions = (ch.attendees || []).map(a => a.id).filter(id => id != null && !existingIds.has(id));
+        if (additions.length > 0) return false;
+        return true;
+      };
+      const realChanges = [];
+      const skippedNoOp = [];
+      for (const ch of changes) {
+        const line = await findLineById(reports, ch.line_id);
+        if (!line) { realChanges.push(ch); continue; } // let it fail loudly later
+        if (noOp(line, ch)) {
+          skippedNoOp.push(ch.line_id);
+          continue;
+        }
+        // Build a "trimmed" change that contains only fields that actually changed,
+        // so the PATCH body doesn't quietly re-set unchanged values.
+        const trimmed = { line_id: ch.line_id };
+        if (ch.new_description != null && !sameStr(ch.new_description, line.description)) {
+          trimmed.new_description = ch.new_description;
+        }
+        if (ch.new_category_id != null && Number(ch.new_category_id) !== Number(line.expense_category_id)) {
+          trimmed.new_category_id = ch.new_category_id;
+          trimmed.new_category_name = ch.new_category_name;
+        }
+        const existingIds = new Set((line.expense_attendees || []).map(a => a.id));
+        trimmed.attendees = (ch.attendees || []).filter(a => a.id != null && !existingIds.has(a.id));
+        realChanges.push(trimmed);
+      }
+
+      if (!realChanges.length) {
+        status.textContent = `No changes to apply — ${skippedNoOp.length} row(s) were already in the desired state.`;
+        return;
+      }
+
+      // Apply the FIRST real change, ask user to confirm
+      const first = realChanges[0];
       const firstLine = await findLineById(reports, first.line_id);
       if (!firstLine) {
         status.textContent = `First line ${first.line_id} not found in any draft report. Aborting.`;
@@ -1025,15 +1068,16 @@
         `<b>Line ${first.line_id}</b> &mdash; ${escapeHtml(firstLine.merchant || '')}<br>` +
         (first.new_category_name ? `&bull; category set to: <i>${escapeHtml(first.new_category_name)}</i><br>` : '') +
         (first.new_description ? `&bull; description set to: <i>${escapeHtml(first.new_description)}</i><br>` : '') +
-        (first.attendees.length ? `&bull; attendees added: ${first.attendees.map(a => escapeHtml(a.first_name + ' ' + a.last_name)).join(', ')}<br>` : '');
+        (first.attendees && first.attendees.length ? `&bull; attendees added: ${first.attendees.map(a => escapeHtml(a.first_name + ' ' + a.last_name)).join(', ')}<br>` : '') +
+        (skippedNoOp.length ? `<div style="color:#888;font-size:11px;margin-top:6px;">(${skippedNoOp.length} other row(s) were already up-to-date and will be skipped.)</div>` : '');
       const ok = await showFirstLineConfirm(panel, summary);
       if (!ok) {
-        status.textContent = `Stopped after first line. ${changes.length - 1} more were not applied.`;
+        status.textContent = `Stopped after first line. ${realChanges.length - 1} more were not applied. ${skippedNoOp.length} no-op rows skipped.`;
         return;
       }
 
       // Apply the rest
-      const rest = changes.slice(1);
+      const rest = realChanges.slice(1);
       setProgress(0, rest.length);
       let okCount = 0, failCount = 0;
       const failures = [];
@@ -1049,11 +1093,11 @@
           } catch (e) { failCount++; failures.push({ line_id: ch.line_id, error: String(e).slice(0, 200) }); }
         }
         setProgress(i + 1, rest.length);
-        status.textContent = `ok=${okCount + 1} fail=${failCount}`;
+        status.textContent = `ok=${okCount + 1} fail=${failCount} skipped=${skippedNoOp.length}`;
         await new Promise(r => setTimeout(r, 120));
       }
 
-      status.innerHTML = `<b>Done.</b> ok=${okCount + 1} / fail=${failCount}` +
+      status.innerHTML = `<b>Done.</b> ok=${okCount + 1} / fail=${failCount} / no-op skipped=${skippedNoOp.length}` +
         (failures.length ? ` <a href="data:application/json;base64,${btoa(JSON.stringify(failures, null, 2))}" download="upload-apply-failures.json" style="color:#06c;">download failures</a>` : '');
       progressBar.style.background = failCount > 0 ? '#c60' : '#0a7';
     } catch (e) {
