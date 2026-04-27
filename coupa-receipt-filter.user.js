@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Coupa Receipt Filter (Attach Receipt dialog, ±% across currencies)
 // @namespace    local.tylerkeller
-// @version      0.4.4
-// @description  Filter the Coupa "Attach a receipt" dialog to receipts within ±X% of the expense line's Total Amount (USD/EUR/COP/SGD/TRY). Adds a compact top-right panel with an "Apply Account to All" button (skips lines that already have the configured account).
+// @version      0.4.5
+// @description  Filter the Coupa "Attach a receipt" dialog to receipts within ±X% of the expense line's Total Amount (USD/EUR/COP/SGD/TRY). Adds a compact top-right panel with an "Apply Account to All" button + progress bar (skips lines that already have the configured account).
 // @match        https://*.coupahost.com/*
 // @run-at       document-idle
 // @grant        GM_xmlhttpRequest
@@ -320,8 +320,28 @@
     return u.toString();
   }
 
-  async function runApplyAccountToAll(reportIds, statusEl) {
+  async function runApplyAccountToAll(reportIds, panel) {
     window.__rfAcctRunning = true;
+    const statusEl = panel.querySelector('.__rf_acct_status');
+    const btn = panel.querySelector('.__rf_apply_account_btn');
+    const progressWrap = panel.querySelector('.__rf_progress_wrap');
+    const progressBar = panel.querySelector('.__rf_progress_bar');
+    const progressText = panel.querySelector('.__rf_progress_text');
+    const setProgress = (done, total) => {
+      const pct = total > 0 ? Math.min(100, (done / total) * 100) : 0;
+      progressBar.style.width = pct.toFixed(1) + '%';
+      progressText.textContent = total > 0 ? `${done} / ${total} (${pct.toFixed(0)}%)` : '';
+    };
+    progressWrap.style.display = 'block';
+    progressText.style.display = 'block';
+    btn.disabled = true;
+    btn.style.opacity = '0.6';
+    btn.style.cursor = 'wait';
+    btn.textContent = 'Running…';
+    // Warn user if they try to navigate while running
+    const beforeUnload = (e) => { e.preventDefault(); e.returnValue = ''; };
+    window.addEventListener('beforeunload', beforeUnload);
+
     const csrf = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content');
     const headers = {
       'Accept': 'application/json, text/plain, */*',
@@ -333,49 +353,58 @@
     const failures = [];
     statusEl.textContent = 'Fetching reports…';
 
-    const allLines = [];
-    for (const rid of reportIds) {
-      try {
-        const rpt = await fetchReportLines(rid);
-        if (rpt && Array.isArray(rpt.expense_lines)) {
-          for (const l of rpt.expense_lines) allLines.push(l);
+    try {
+      const allLines = [];
+      for (const rid of reportIds) {
+        try {
+          const rpt = await fetchReportLines(rid);
+          if (rpt && Array.isArray(rpt.expense_lines)) {
+            for (const l of rpt.expense_lines) allLines.push(l);
+          }
+        } catch (e) {
+          failures.push({ report_id: rid, error: 'fetch failed: ' + String(e).slice(0, 100) });
         }
-      } catch (e) {
-        failures.push({ report_id: rid, error: 'fetch failed: ' + String(e).slice(0, 100) });
       }
-    }
 
-    // Skip lines that already have the target account assigned.
-    const needsUpdate = allLines.filter(l => {
-      const accounts = Array.isArray(l.accounts) ? l.accounts : [];
-      return !accounts.some(a => Number(a.account_id) === DEFAULT_ACCOUNT.account_id);
-    });
-    skipped = allLines.length - needsUpdate.length;
-    const total = needsUpdate.length;
-    statusEl.textContent = `${skipped} already have account, patching ${total}…`;
+      const needsUpdate = allLines.filter(l => {
+        const accounts = Array.isArray(l.accounts) ? l.accounts : [];
+        return !accounts.some(a => Number(a.account_id) === DEFAULT_ACCOUNT.account_id);
+      });
+      skipped = allLines.length - needsUpdate.length;
+      const total = needsUpdate.length;
+      statusEl.textContent = `${skipped} already set, patching ${total}…`;
+      setProgress(0, total);
 
-    for (const line of needsUpdate) {
-      try {
-        const r = await fetch(`/expenses/expense_lines/${line.id}`, {
-          method: 'PATCH',
-          credentials: 'include',
-          headers,
-          body: buildAccountPatchBody(line),
-        });
-        if (r.ok) ok++;
-        else { fail++; const txt = await r.text(); failures.push({ line_id: line.id, status: r.status, head: txt.slice(0, 200) }); }
-      } catch (e) {
-        fail++; failures.push({ line_id: line.id, error: String(e).slice(0, 200) });
+      for (const line of needsUpdate) {
+        try {
+          const r = await fetch(`/expenses/expense_lines/${line.id}`, {
+            method: 'PATCH',
+            credentials: 'include',
+            headers,
+            body: buildAccountPatchBody(line),
+          });
+          if (r.ok) ok++;
+          else { fail++; const txt = await r.text(); failures.push({ line_id: line.id, status: r.status, head: txt.slice(0, 200) }); }
+        } catch (e) {
+          fail++; failures.push({ line_id: line.id, error: String(e).slice(0, 200) });
+        }
+        const done = ok + fail;
+        setProgress(done, total);
+        statusEl.textContent = `ok=${ok} fail=${fail} (skipped ${skipped})`;
+        await new Promise(r => setTimeout(r, 120));
       }
-      const done = ok + fail;
-      if (done % 5 === 0 || done === total) {
-        statusEl.textContent = `${done}/${total} ok=${ok} fail=${fail} (skipped ${skipped} already-set)`;
-      }
-      await new Promise(r => setTimeout(r, 120));
+
+      statusEl.innerHTML = `<b>Done.</b> ok=${ok} / fail=${fail} / skipped ${skipped}` +
+        (failures.length ? ` <a href="data:application/json;base64,${btoa(JSON.stringify(failures, null, 2))}" download="account-apply-failures.json" style="color:#06c;">download failures</a>` : '');
+      progressBar.style.background = fail > 0 ? '#c60' : '#0a7';
+    } finally {
+      window.__rfAcctRunning = false;
+      window.removeEventListener('beforeunload', beforeUnload);
+      btn.disabled = false;
+      btn.style.opacity = '';
+      btn.style.cursor = 'pointer';
+      btn.textContent = 'Apply Account to All';
     }
-    window.__rfAcctRunning = false;
-    statusEl.innerHTML = `<b>Account apply complete.</b> ok=${ok} / fail=${fail} / skipped ${skipped}` +
-      (failures.length ? ` <a href="data:application/json;base64,${btoa(JSON.stringify(failures, null, 2))}" download="account-apply-failures.json" style="color:#06c;">download failures</a>` : '');
   }
 
   // ---------- persistent top-right account panel ----------
@@ -410,6 +439,10 @@
         <button class="__rf_panel_collapse" type="button" title="Hide" style="background:transparent;border:none;cursor:pointer;color:#888;font-size:14px;line-height:1;padding:0;">&times;</button>
       </div>
       <button class="__rf_apply_account_btn" type="button" style="background:#06c;color:#fff;border:1px solid #048;padding:5px 8px;border-radius:3px;cursor:pointer;width:100%;">Apply Account to All</button>
+      <div class="__rf_progress_wrap" style="display:none;margin-top:6px;height:10px;background:#eef;border:1px solid #abc;border-radius:4px;overflow:hidden;">
+        <div class="__rf_progress_bar" style="height:100%;width:0%;background:#06c;transition:width 200ms ease;"></div>
+      </div>
+      <div class="__rf_progress_text" style="display:none;margin-top:3px;font-size:10px;color:#06c;text-align:center;font-variant-numeric:tabular-nums;"></div>
       <div style="margin-top:6px;font-size:11px;line-height:1.3;word-break:break-word;">
         <b>Account:</b> ${DEFAULT_ACCOUNT.display_name}<br>
         <span style="color:#888;">id ${DEFAULT_ACCOUNT.account_id} &middot; ${DEFAULT_ACCOUNT.code}</span>
@@ -431,7 +464,7 @@
         status.textContent = 'cancelled';
         return;
       }
-      runApplyAccountToAll(draftIds, status);
+      runApplyAccountToAll(draftIds, panel);
     });
   }
 
