@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Coupa Receipt Filter (Attach Receipt dialog, ±% across currencies)
 // @namespace    local.tylerkeller
-// @version      0.4.1
-// @description  Filter the Coupa "Attach a receipt" dialog to receipts within ±X% of the expense line's Total Amount (USD/EUR/COP/SGD/TRY). Also adds an "Apply Account to All" button that PATCHes every draft expense line that doesn't already have the configured account.
+// @version      0.4.2
+// @description  Filter the Coupa "Attach a receipt" dialog to receipts within ±X% of the expense line's Total Amount (USD/EUR/COP/SGD/TRY). Adds a persistent top-right panel on the Expenses page with an "Apply Account to All" button (skips lines that already have the configured account).
 // @match        https://*.coupahost.com/*
 // @run-at       document-idle
 // @grant        GM_xmlhttpRequest
@@ -121,17 +121,10 @@
         <label><input class="__rf_auto" type="checkbox" checked> auto</label>
         <button class="__rf_clear" type="button">Show all</button>
         <button class="__rf_fx" type="button" title="Refetch FX">&#8635; FX</button>
-        <span style="border-left:1px solid #c69; margin:0 4px; height:18px;"></span>
-        <button class="__rf_apply_account" type="button" title="PATCH every line in every draft report with the configured account (skips lines that already have it)" style="background:#06c;color:#fff;border:1px solid #048;padding:3px 8px;border-radius:3px;">Apply Account to All</button>
-      </div>
-      <div class="__rf_acct_info" style="margin-top:4px;color:#06c;font-size:11px;">
-        <b>Account:</b> ${DEFAULT_ACCOUNT.display_name}
-        <span style="color:#888;">(id ${DEFAULT_ACCOUNT.account_id} — ${DEFAULT_ACCOUNT.code})</span>
       </div>
       <div class="__rf_meta" style="margin-top:6px;color:#222;"></div>
       <div class="__rf_targets" style="margin-top:4px;color:#444;"></div>
       <div class="__rf_status" style="margin-top:4px;color:#555;"></div>
-      <div class="__rf_acct_status" style="margin-top:4px;color:#06c;"></div>
     `;
 
     // Insert bar at top of dialog
@@ -234,23 +227,6 @@
       fxCache = null;
       await refresh();
     });
-    $('.__rf_apply_account').addEventListener('click', async () => {
-      if (window.__rfAcctRunning) {
-        $('.__rf_acct_status').textContent = 'Already running…';
-        return;
-      }
-      const draftReportIds = (window.ExpenseReports || [])
-        .filter(r => r.status === 'draft')
-        .map(r => r.id);
-      if (!draftReportIds.length) {
-        $('.__rf_acct_status').textContent = 'No draft reports found in this page.';
-        return;
-      }
-      if (!confirm(`Apply account ${DEFAULT_ACCOUNT.account_id} to every line in ${draftReportIds.length} draft reports?\n\nThis is a bulk PATCH that may take several minutes.`)) {
-        return;
-      }
-      runApplyAccountToAll(draftReportIds, $('.__rf_acct_status'));
-    });
 
     // Re-apply when new receipts get added/removed inside the dialog (e.g., infinite scroll)
     const list = dialog.querySelector('ul') || dialog;
@@ -265,20 +241,46 @@
   }
 
   // ---------- bulk account-apply ----------
+  // Parse the embedded "var ExpenseReports = [...]" JSON from a Coupa HTML page.
+  function parseExpenseReportsFromHtml(html) {
+    const start = html.search(/var\s+ExpenseReports\s*=\s*\[/);
+    if (start < 0) return null;
+    const arrStart = html.indexOf('[', start);
+    let depth = 0, i = arrStart, inStr = false, strCh = '', esc = false;
+    for (; i < html.length; i++) {
+      const c = html[i];
+      if (inStr) { if (esc) esc = false; else if (c === '\\') esc = true; else if (c === strCh) inStr = false; }
+      else { if (c === '"' || c === '\'') { inStr = true; strCh = c; } else if (c === '[') depth++; else if (c === ']') { depth--; if (depth === 0) { i++; break; } } }
+    }
+    try { return JSON.parse(html.slice(arrStart, i)); } catch { return null; }
+  }
+
+  async function findDraftReportIds() {
+    // Try the in-page global first (works without Tampermonkey isolation; only the
+    // bundle-context global is reliably accessible via unsafeWindow when granted).
+    try {
+      // eslint-disable-next-line no-undef
+      const w = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+      if (Array.isArray(w.ExpenseReports) && w.ExpenseReports.length) {
+        return w.ExpenseReports.filter(r => r.status === 'draft').map(r => r.id);
+      }
+    } catch {}
+    // Fallback: fetch the listing page and parse the embedded JSON.
+    try {
+      const r = await fetch('/expenses', { credentials: 'include' });
+      const html = await r.text();
+      const arr = parseExpenseReportsFromHtml(html);
+      if (Array.isArray(arr)) return arr.filter(r => r.status === 'draft').map(r => r.id);
+    } catch {}
+    return [];
+  }
+
   function fetchReportLines(reportId) {
     return fetch(`/expense_reports/${reportId}/edit`, { credentials: 'include' })
       .then(r => r.text())
       .then(html => {
-        const start = html.search(/var\s+ExpenseReports\s*=\s*\[/);
-        if (start < 0) return null;
-        const arrStart = html.indexOf('[', start);
-        let depth = 0, i = arrStart, inStr = false, strCh = '', esc = false;
-        for (; i < html.length; i++) {
-          const c = html[i];
-          if (inStr) { if (esc) esc = false; else if (c === '\\') esc = true; else if (c === strCh) inStr = false; }
-          else { if (c === '"' || c === '\'') { inStr = true; strCh = c; } else if (c === '[') depth++; else if (c === ']') { depth--; if (depth === 0) { i++; break; } } }
-        }
-        return JSON.parse(html.slice(arrStart, i)).find(p => p.id === reportId);
+        const arr = parseExpenseReportsFromHtml(html);
+        return arr ? arr.find(p => p.id === reportId) : null;
       });
   }
 
@@ -374,6 +376,63 @@
       (failures.length ? ` <a href="data:application/json;base64,${btoa(JSON.stringify(failures, null, 2))}" download="account-apply-failures.json" style="color:#06c;">download failures</a>` : '');
   }
 
+  // ---------- persistent top-right account panel ----------
+  function isExpensesPage() {
+    return /\/expense(?:s|_reports)/i.test(location.pathname);
+  }
+
+  function mountAccountPanel() {
+    if (!isExpensesPage()) return;
+    if (document.getElementById('__rf_acct_panel')) return;
+    const panel = document.createElement('div');
+    panel.id = '__rf_acct_panel';
+    panel.style.cssText = [
+      'position:fixed',
+      'top:10px',
+      'right:10px',
+      'z-index:99999',
+      'padding:10px 12px',
+      'background:#fff',
+      'border:1px solid #06c',
+      'border-radius:6px',
+      'font:12px sans-serif',
+      'box-shadow:0 2px 8px rgba(0,0,0,.15)',
+      'max-width:340px',
+      'color:#222',
+    ].join(';');
+    panel.innerHTML = `
+      <div style="display:flex;gap:8px;align-items:center;justify-content:space-between;">
+        <strong style="color:#06c;">Coupa Receipt Filter</strong>
+        <button class="__rf_panel_collapse" type="button" title="Hide" style="background:transparent;border:none;cursor:pointer;color:#888;">&times;</button>
+      </div>
+      <div style="margin-top:6px;">
+        <button class="__rf_apply_account_btn" type="button" style="background:#06c;color:#fff;border:1px solid #048;padding:5px 10px;border-radius:3px;cursor:pointer;">Apply Account to All</button>
+      </div>
+      <div style="margin-top:6px;font-size:11px;line-height:1.3;">
+        <b>Account:</b> ${DEFAULT_ACCOUNT.display_name}<br>
+        <span style="color:#888;">id ${DEFAULT_ACCOUNT.account_id} &middot; ${DEFAULT_ACCOUNT.code}</span>
+      </div>
+      <div class="__rf_acct_status" style="margin-top:6px;font-size:11px;color:#06c;min-height:14px;"></div>
+    `;
+    document.body.appendChild(panel);
+    panel.querySelector('.__rf_panel_collapse').addEventListener('click', () => panel.remove());
+    panel.querySelector('.__rf_apply_account_btn').addEventListener('click', async () => {
+      const status = panel.querySelector('.__rf_acct_status');
+      if (window.__rfAcctRunning) { status.textContent = 'Already running…'; return; }
+      status.textContent = 'Finding draft reports…';
+      const draftIds = await findDraftReportIds();
+      if (!draftIds.length) {
+        status.textContent = 'No draft reports found. Are you signed in to Coupa expenses?';
+        return;
+      }
+      if (!confirm(`Apply account ${DEFAULT_ACCOUNT.account_id} (${DEFAULT_ACCOUNT.display_name}) to every line in ${draftIds.length} draft reports?\n\nLines that already have this account will be skipped.\n\nThis is a bulk PATCH that may take several minutes.`)) {
+        status.textContent = 'cancelled';
+        return;
+      }
+      runApplyAccountToAll(draftIds, status);
+    });
+  }
+
   // ---------- dialog watcher ----------
   function isAttachDialog(el) {
     if (!(el instanceof Element)) return false;
@@ -400,4 +459,16 @@
 
   // First pass in case the dialog is already open when the script loads.
   scanForDialogs();
+  // Mount persistent account panel
+  mountAccountPanel();
+  // Re-mount on SPA-style URL changes
+  let _lastPath = location.pathname;
+  setInterval(() => {
+    if (location.pathname !== _lastPath) {
+      _lastPath = location.pathname;
+      const ex = document.getElementById('__rf_acct_panel');
+      if (!isExpensesPage() && ex) ex.remove();
+      else if (isExpensesPage() && !ex) mountAccountPanel();
+    }
+  }, 1000);
 })();
