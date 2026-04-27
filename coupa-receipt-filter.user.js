@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Coupa Receipt Filter (Attach Receipt dialog, ±% across currencies)
 // @namespace    local.tylerkeller
-// @version      0.6.0
+// @version      0.6.1
 // @description  Filter the Coupa "Attach a receipt" dialog by ±X%, plus a top-right panel with Apply-Account-to-All, Download-Problems (xlsx with red/yellow row highlights AND conditional formatting on invalid entries), and Upload-and-Apply (description + attendee bulk edit with first-line confirmation + progress bar).
 // @match        https://*.coupahost.com/*
 // @run-at       document-idle
@@ -566,9 +566,7 @@
 
     const attendees = collectAttendeeDirectory(reports);
     const usedCategories = collectUsedCategories(reports);
-    const RED = 'FFFFC7CE';      // light red
-    const YELLOW = 'FFFFEB9C';    // light yellow
-    const ORANGE = 'FFFFD699';    // light orange (red+yellow)
+    const YELLOW = 'FFFFEB9C';    // light yellow — only used for gift-meal-per-attendee rows
     const GREEN_HDR = 'FFC8E6C9'; // light green for editable column headers
 
     const wb = new ExcelJS.Workbook();
@@ -630,12 +628,12 @@
         attendees.forEach(a => row.push(attIds.has(a.id) ? 'x' : ''));
         const r = sh.addRow(row);
 
-        const hasRedProblem = problems.some(p => p === 'missing_receipt_>$25' || p === 'missing_account' || p === 'missing_category');
+        // Only keep YELLOW row tint for gift-meal-per-attendee>$25 rows.
+        // (User asked: red ONLY on per-cell CF for new_category + attendee cols, nothing else.)
         const hasYellow = problems.includes('gift_meal_per_attendee_>$25');
-        const fillColor = hasRedProblem && hasYellow ? ORANGE : hasRedProblem ? RED : hasYellow ? YELLOW : null;
-        if (fillColor) {
+        if (hasYellow) {
           r.eachCell({ includeEmpty: false }, cell => {
-            cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: fillColor } };
+            cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: YELLOW } };
           });
         }
       });
@@ -716,33 +714,8 @@
     noteRow.getCell(1).value = 'To add a NEW attendee: append a row with id BLANK, leave type_id blank (defaults to 6), set first_name and last_name. Use "first last" as a column header on the Lines sheet to mark X.';
     noteRow.getCell(1).font = { italic: true, color: { argb: 'FF888888' } };
 
-    // Conditional formatting on Attendees (wrapped so failures don't sink download).
-    try {
-      ash.addConditionalFormatting({
-        ref: 'A2:A10000',
-        rules: [{
-          type: 'expression',
-          priority: 1,
-          formulae: ['AND(LEN(A2)>0, NOT(ISNUMBER(A2)))'],
-          style: {
-            fill: { type: 'pattern', pattern: 'solid', bgColor: { argb: 'FFFF6B6B' } },
-            font: { color: { argb: 'FFFFFFFF' }, bold: true },
-          },
-        }],
-      });
-      ash.addConditionalFormatting({
-        ref: 'B2:B10000',
-        rules: [{
-          type: 'expression',
-          priority: 1,
-          formulae: ['AND(LEN(B2)>0, NOT(OR(B2=5, B2=6)))'],
-          style: {
-            fill: { type: 'pattern', pattern: 'solid', bgColor: { argb: 'FFFF6B6B' } },
-            font: { color: { argb: 'FFFFFFFF' }, bold: true },
-          },
-        }],
-      });
-    } catch (e) { console.warn('[CoupaReceiptFilter] Attendees conditional formatting skipped:', e); }
+    // (No conditional formatting on Attendees sheet — user requested no red anywhere
+    // except per-cell on Lines new_category and attendee columns.)
 
     status.textContent = `Building xlsx (${problemRows} problem rows)…`;
     const buf = await wb.xlsx.writeBuffer();
