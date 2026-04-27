@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Coupa Receipt Filter (Attach Receipt dialog, ±% across currencies)
 // @namespace    local.tylerkeller
-// @version      0.8.2
+// @version      0.8.3
 // @description  Filter the Coupa "Attach a receipt" dialog by ±X%, plus a top-right panel with Apply-Account-to-All, Download-Problems (xlsx with red/yellow row highlights AND conditional formatting on invalid entries), and Upload-and-Apply (description + attendee bulk edit with first-line confirmation + progress bar).
 // @match        https://*.coupahost.com/*
 // @run-at       document-idle
@@ -42,7 +42,23 @@
     localStorage.removeItem(ACTIVE_ACCOUNT_LSKEY);
   }
 
-  const SCRIPT_VERSION = '0.8.2';
+  const SCRIPT_VERSION = '0.8.3';
+  // Palette used to randomize the help-modal accent color each open
+  const HELP_PALETTE = [
+    { fg: '#1976D2', name: 'blue' },
+    { fg: '#388E3C', name: 'green' },
+    { fg: '#7B1FA2', name: 'purple' },
+    { fg: '#D32F2F', name: 'red' },
+    { fg: '#F57C00', name: 'orange' },
+    { fg: '#00796B', name: 'teal' },
+    { fg: '#C2185B', name: 'pink' },
+    { fg: '#303F9F', name: 'indigo' },
+    { fg: '#5D4037', name: 'brown' },
+    { fg: '#455A64', name: 'blue-grey' },
+  ];
+  function pickHelpAccent() {
+    return HELP_PALETTE[Math.floor(Math.random() * HELP_PALETTE.length)].fg;
+  }
   const SCRIPT_UPDATE_URL = 'https://gist.githubusercontent.com/SexualMoose/a0de5a5bf56d33abef414b5781bdd984/raw/coupa-receipt-filter.user.js';
   const EXCELJS_URL = 'https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js';
   const FX_BASE_URL = 'https://open.er-api.com/v6/latest/USD';
@@ -1523,17 +1539,18 @@
   // ---------- help modal ----------
   function showHelpModal() {
     if (document.getElementById('__rf_help_modal')) return;
+    const accent = pickHelpAccent();
     const overlay = document.createElement('div');
     overlay.id = '__rf_help_modal';
     overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:100001;display:flex;align-items:center;justify-content:center;font:13px sans-serif;color:#222;';
     overlay.innerHTML = `
-      <div style="background:#fff;padding:22px 26px;border-radius:8px;max-width:680px;max-height:88vh;overflow:auto;box-shadow:0 6px 22px rgba(0,0,0,0.3);">
+      <div style="background:#fff;padding:22px 26px;border-radius:8px;max-width:680px;max-height:88vh;overflow:auto;box-shadow:0 6px 22px rgba(0,0,0,0.3);border-top:4px solid ${accent};">
         <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;">
-          <h2 style="margin:0 0 8px 0;color:#06c;">Coupa Receipt Filter — How it works</h2>
+          <h2 style="margin:0 0 8px 0;color:${accent};">Coupa Receipt Filter — How it works</h2>
           <button class="__rf_help_close" type="button" style="background:transparent;border:none;color:#888;font-size:22px;line-height:1;cursor:pointer;">&times;</button>
         </div>
         <p style="margin:6px 0 14px 0;color:#666;">A Tampermonkey userscript that bulk-edits Coupa expense reports. Lives at top-right of any Coupa <code>/expenses*</code> page and operates only on <b>draft</b> reports.</p>
-        <h3 style="margin:14px 0 4px 0;color:#222;">Buttons</h3>
+        <h3 style="margin:14px 0 4px 0;color:${accent};">Buttons</h3>
         <ul style="margin:0 0 0 18px;padding:0;line-height:1.55;">
           <li><b>Apply Account to All</b> — PATCHes every draft line whose <code>accounts[]</code> doesn't already include the configured account (currently id <code>${getActiveAccount().account_id}</code>, ${escapeHtml(getActiveAccount().display_name)}). Skips lines that are already set, so re-running is safe and fast.</li>
           <li><b>Account selector</b> — type to search Coupa accounts (uses Coupa's own autocomplete). The ↺ button reverts to the script default (id <code>${DEFAULT_ACCOUNT.account_id}</code>, ${escapeHtml(DEFAULT_ACCOUNT.display_name)}). The selection is stored in your browser's localStorage and reused by Apply Account to All + the Upload &amp; Apply pipeline.</li>
@@ -1542,19 +1559,19 @@
           <li><b>Export All</b> — same xlsx structure but includes every draft line, not just non-compliant ones. Useful for a complete audit pass.</li>
           <li><b>Upload &amp; Apply</b> — opens a file picker, ingests the edited xlsx, and PATCHes the lines. Compares each row against the line's live state and skips no-op rows. Confirms the first applied change before continuing.</li>
         </ul>
-        <h3 style="margin:14px 0 4px 0;color:#222;">Workbook layout (Lines sheet)</h3>
+        <h3 style="margin:14px 0 4px 0;color:${accent};">Workbook layout (Lines sheet)</h3>
         <ul style="margin:0 0 0 18px;padding:0;line-height:1.55;">
           <li>Read-only context: <code>line_id, report, merchant, date, amount, currency, usd_eq, current_category, problems, current_description, current_attendees</code>.</li>
           <li>Editable (green header): <code>new_category</code> (dropdown of categories you've used), <code>new_description</code> (free text), <code>&lt;person&gt;</code> attendee columns (mark <code>x</code> to add).</li>
           <li>Hidden helper sheet <code>_categories</code> drives both the dropdown and the upload's name→id resolution. Don't delete it.</li>
         </ul>
-        <h3 style="margin:14px 0 4px 0;color:#222;">Workbook layout (Attendees sheet)</h3>
+        <h3 style="margin:14px 0 4px 0;color:${accent};">Workbook layout (Attendees sheet)</h3>
         <ul style="margin:0 0 0 18px;padding:0;line-height:1.55;">
           <li>Existing attendees you've used appear with their Coupa <code>id</code>, <code>type_id</code> (5 = Coupa user, 6 = manual entry), <code>first_name</code>, <code>last_name</code>.</li>
           <li>To add a NEW attendee: append a row, leave <code>id</code> blank, set first &amp; last name. On upload, the script POSTs to <code>/expense_attendees/</code> to create them, then uses the returned id when applying any rows that reference that name.</li>
           <li>To use a new attendee on a line, you must also add a column on Lines named <code>"first last"</code> (without an id) and put <code>x</code> in the row.</li>
         </ul>
-        <h3 style="margin:14px 0 4px 0;color:#222;">Validation &amp; safety</h3>
+        <h3 style="margin:14px 0 4px 0;color:${accent};">Validation &amp; safety</h3>
         <ul style="margin:0 0 0 18px;padding:0;line-height:1.55;">
           <li>Conditional formatting marks invalid cells red live in Excel; the upload validates the same rules and aborts before any PATCH if it finds one (with a downloadable list of bad cells).</li>
           <li>Yellow row tint = informational only (gift-meal value-per-attendee &gt; $25). Doesn't block anything.</li>
@@ -1563,7 +1580,7 @@
           <li>Counters always reconcile: <code>ok + fail + skipped</code> = total rows the script considered.</li>
         </ul>
         <div style="text-align:right;margin-top:16px;">
-          <button class="__rf_help_close2" type="button" style="background:#06c;color:#fff;border:1px solid #048;padding:6px 14px;border-radius:3px;cursor:pointer;">Got it</button>
+          <button class="__rf_help_close2" type="button" style="background:${accent};color:#fff;border:1px solid ${accent};padding:6px 14px;border-radius:3px;cursor:pointer;">Got it</button>
         </div>
       </div>
     `;
