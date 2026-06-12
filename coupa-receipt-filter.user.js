@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Coupa Receipt Filter (Attach Receipt dialog, ±% across currencies)
 // @namespace    local.tylerkeller
-// @version      0.8.5
+// @version      0.8.6
 // @description  Filter the Coupa "Attach a receipt" dialog by ±X%, plus a top-right panel with Apply-Account-to-All, Download-Problems (xlsx with red/yellow row highlights AND conditional formatting on invalid entries), and Upload-and-Apply (description + attendee bulk edit with first-line confirmation + progress bar).
 // @match        https://*.coupahost.com/*
 // @run-at       document-idle
@@ -42,7 +42,7 @@
     localStorage.removeItem(ACTIVE_ACCOUNT_LSKEY);
   }
 
-  const SCRIPT_VERSION = '0.8.5';
+  const SCRIPT_VERSION = '0.8.6';
   // Palette used to randomize the help-modal accent color each open
   const HELP_PALETTE = [
     { fg: '#1976D2', name: 'blue' },
@@ -63,10 +63,60 @@
   const EXCELJS_URL = 'https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js';
   const FX_BASE_URL = 'https://open.er-api.com/v6/latest/USD';
   const PROBLEM_USD_THRESHOLD = 25;
-  // Categories subject to the per-attendee $25 cap (internal-employee gifts).
-  //   85 = "Entertainment (Gift): To Internal Employee - Meal"
-  //   86 = "Entertainment (Gift): To Internal Employee - Event"
-  const GIFT_PER_ATTENDEE_CATEGORY_IDS = new Set([85, 86]);
+  const GIFT_MEAL_CATEGORY_ID = 85; // "Entertainment (Gift): To Internal Employee - Meal" (per-attendee $25 cap)
+
+  // Full Coupa expense-category catalog (id + exact name). Used to seed the
+  // new_category dropdown AND the upload validator so you can re-classify a line
+  // into ANY valid category — not just the handful already in use on draft lines.
+  // Keep names byte-for-byte identical to Coupa (trailing spaces etc. preserved).
+  const ALL_CATEGORIES = [
+    { id: 71, name: 'Airfare - domestic' },
+    { id: 72, name: 'Airfare - international' },
+    { id: 73, name: 'Airfare - other charges' },
+    { id: 29, name: 'Baggage Fees' },
+    { id: 50, name: 'BDP Global Conferences' },
+    { id: 27, name: 'Car Rental' },
+    { id: 53, name: 'Cell Phone Service Charges' },
+    { id: 30, name: 'Conference or Seminars' },
+    { id: 31, name: 'Customer Service Week' },
+    { id: 91, name: 'Disputed Transaction' },
+    { id: 89, name: 'Entertainment (Gift): To Client/ Customer/ Other - Event' },
+    { id: 88, name: 'Entertainment (Gift): To Client/ Customer/ Other - Meal' },
+    { id: 90, name: 'Entertainment (Gift): To Client/ Customer/ Other - Other' },
+    { id: 86, name: 'Entertainment (Gift): To Internal Employee - Event' },
+    { id: 85, name: 'Entertainment (Gift): To Internal Employee - Meal' },
+    { id: 87, name: 'Entertainment (Gifts): To Internal Employee - Other' },
+    { id: 48, name: 'Express Mail Delivery' },
+    { id: 34, name: 'Facilities' },
+    { id: 64, name: 'Foreign Transaction Fee' },
+    { id: 76, name: 'Fuel / Petrol / EV Charging' },
+    { id: 74, name: 'Hotel / Lodging' },
+    { id: 59, name: 'Meals' },
+    { id: 82, name: 'Mileage - AR1 Auto Allowance' },
+    { id: 83, name: 'Mileage - BR1 Auto Allowance' },
+    { id: 84, name: 'Mileage - CL1 Auto Allowance' },
+    { id: 51, name: 'Office - Cable or TV Service' },
+    { id: 52, name: 'Office - Overhead' },
+    { id: 28, name: 'Office - Supplies' },
+    { id: 36, name: 'Office - Wired Internet Service' },
+    { id: 55, name: 'Office - Wireless Internet' },
+    { id: 9, name: 'Parking' },
+    { id: 60, name: 'Passport/VISA Fees' },
+    { id: 81, name: 'Personal Expense' },
+    { id: 39, name: 'Postage' },
+    { id: 43, name: 'Public Transportation' },
+    { id: 40, name: 'Rental Car Fuel/Petrol' },
+    { id: 33, name: 'Subscriptions (Including Web Services)' },
+    { id: 56, name: 'Taxes (Receipt Itemization Only) ' },
+    { id: 75, name: 'Taxi / Rideshare Service' },
+    { id: 41, name: 'Telephone - Cellular' },
+    { id: 63, name: 'Tolls / Road Tolls / Vignette' },
+    { id: 42, name: 'Train' },
+    { id: 44, name: 'Training Expenses' },
+    { id: 45, name: 'Travel - incidentals' },
+    { id: 46, name: 'Travel Agency Fee' },
+    { id: 49, name: 'WIFI' },
+  ];
   const NEW_ATTENDEE_TYPE_ID = 6;   // "BDP Employee (manual entry)"
 
   let excelJsPromise = null;
@@ -544,15 +594,15 @@
     const hasAccount = Array.isArray(line.accounts) && line.accounts.length > 0;
     const hasCategory = !!line.expense_category_id;
     const attendees = line.expense_attendees || [];
-    const isGiftPerAttendee = GIFT_PER_ATTENDEE_CATEGORY_IDS.has(line.expense_category_id);
-    const perAttendee = isGiftPerAttendee && isFinite(amt) ? amt / Math.max(attendees.length, 1) : null;
+    const isGiftMeal = line.expense_category_id === GIFT_MEAL_CATEGORY_ID;
+    const perAttendee = isGiftMeal && isFinite(amt) ? amt / Math.max(attendees.length, 1) : null;
 
     const problems = [];
     if (isFinite(usdEq) && usdEq > PROBLEM_USD_THRESHOLD && !hasReceipt) problems.push('missing_receipt_>$25');
     if (!hasAccount) problems.push('missing_account');
     if (!hasCategory) problems.push('missing_category');
-    if (isGiftPerAttendee && perAttendee != null && perAttendee > PROBLEM_USD_THRESHOLD) problems.push('gift_per_attendee_>$25');
-    return { problems, usdEq, isGiftPerAttendee, attendees, perAttendee };
+    if (isGiftMeal && perAttendee != null && perAttendee > PROBLEM_USD_THRESHOLD) problems.push('gift_meal_per_attendee_>$25');
+    return { problems, usdEq, isGiftMeal, attendees, perAttendee };
   }
 
   function collectAttendeeDirectory(reports) {
@@ -607,16 +657,26 @@
   async function _buildWorkbookInner(ExcelJS, reports, usdRates, status, panel, onlyProblems) {
 
     const attendees = collectAttendeeDirectory(reports);
+    // Dropdown/validator must offer the FULL Coupa catalog so a line can be
+    // re-classified into any category, not only the ~4 already in use. Union the
+    // embedded catalog with anything actually on the data (in case the tenant adds
+    // a category we don't have hard-coded), deduped by exact name.
     const usedCategories = collectUsedCategories(reports);
-    const YELLOW = 'FFFFEB9C';    // light yellow — only used for gift-per-attendee rows (Meal + Event)
+    const catByName = new Map();
+    ALL_CATEGORIES.forEach(c => catByName.set(c.name, c.id));
+    usedCategories.forEach(c => { if (!catByName.has(c.name)) catByName.set(c.name, c.id); });
+    const dropdownCategories = Array.from(catByName.entries())
+      .map(([name, id]) => ({ name, id }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    const YELLOW = 'FFFFEB9C';    // light yellow — only used for gift-meal-per-attendee rows
     const GREEN_HDR = 'FFC8E6C9'; // light green for editable column headers
 
     const wb = new ExcelJS.Workbook();
 
-    // Hidden helper sheet with valid category names (used by CF formula on Lines).
+    // Hidden helper sheet with valid category names (used by the dropdown + CF formula on Lines).
     const catSh = wb.addWorksheet('_categories', { state: 'veryHidden' });
     catSh.addRow(['name', 'id']);
-    usedCategories.forEach(c => catSh.addRow([c.name, c.id]));
+    dropdownCategories.forEach(c => catSh.addRow([c.name, c.id]));
 
     const sh = wb.addWorksheet('Lines');
     // Column order:
@@ -650,7 +710,7 @@
     let problemRows = 0;
     reports.forEach(rpt => {
       (rpt.expense_lines || []).forEach(l => {
-        const { problems, usdEq, isGiftPerAttendee, attendees: lineAttendees, perAttendee } = lineProblems(l, usdRates);
+        const { problems, usdEq, isGiftMeal, attendees: lineAttendees, perAttendee } = lineProblems(l, usdRates);
         if (onlyProblems && !problems.length) return;
         problemRows++;
         const attIds = new Set(lineAttendees.map(a => a.id));
@@ -670,9 +730,9 @@
         attendees.forEach(a => row.push(attIds.has(a.id) ? 'x' : ''));
         const r = sh.addRow(row);
 
-        // Only keep YELLOW row tint for gift-per-attendee>$25 rows (Meal + Event).
+        // Only keep YELLOW row tint for gift-meal-per-attendee>$25 rows.
         // (User asked: red ONLY on per-cell CF for new_category + attendee cols, nothing else.)
-        const hasYellow = problems.includes('gift_per_attendee_>$25');
+        const hasYellow = problems.includes('gift_meal_per_attendee_>$25');
         if (hasYellow) {
           r.eachCell({ includeEmpty: false }, cell => {
             cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: YELLOW } };
@@ -685,7 +745,7 @@
     // Excel inline dropdown limit is ~255 chars when using a literal list; for safety,
     // reference the hidden _categories sheet's range instead.
     try {
-      const catRows = usedCategories.length;
+      const catRows = dropdownCategories.length;
       if (catRows > 0) {
         const lastDataRow = Math.max(2, problemRows + 1);
         for (let r = 2; r <= lastDataRow; r++) {
@@ -837,9 +897,12 @@
     // Attendee columns are anything after current_attendees
     const attendeeColStart = colIdx('current_attendees') + 1;
 
-    // Build category-name -> id map by reading the hidden _categories helper sheet
-    // (or fall back to whatever is on the report data if the helper sheet was stripped).
+    // Build category-name -> id map. Seed from the embedded full catalog FIRST so
+    // any valid Coupa category is accepted even if the uploaded workbook was generated
+    // by an older version whose _categories helper sheet only listed in-use categories.
+    // Then overlay the uploaded helper sheet (lets a future tenant-specific category win).
     const categoryNameToId = new Map();
+    ALL_CATEGORIES.forEach(c => categoryNameToId.set(c.name.trim(), Number(c.id)));
     const helperSheet = wb.getWorksheet('_categories');
     if (helperSheet) {
       helperSheet.eachRow({ includeEmpty: false }, (row, idx) => {
@@ -1560,7 +1623,7 @@
           <li><b>Apply Account to All</b> — PATCHes every draft line whose <code>accounts[]</code> doesn't already include the configured account (currently id <code>${getActiveAccount().account_id}</code>, ${escapeHtml(getActiveAccount().display_name)}). Skips lines that are already set, so re-running is safe and fast.</li>
           <li><b>Account selector</b> — type to search Coupa accounts (uses Coupa's own autocomplete). The ↺ button reverts to the script default (id <code>${DEFAULT_ACCOUNT.account_id}</code>, ${escapeHtml(DEFAULT_ACCOUNT.display_name)}). The selection is stored in your browser's localStorage and reused by Apply Account to All + the Upload &amp; Apply pipeline.</li>
           <li><b>Match Receipts</b> — scans the wallet sidebar (<code>li.walletLine</code>) and pairs receipts to draft lines that don't yet have one. Tiers (highest score wins): exact same currency + amount → ±1% same currency + ≥1 token of merchant overlap → cross-currency within ±12% USD-equivalent + token overlap. Posts <code>/expenses/wallet/merge_receipt_to_expense_line</code> per match. Confirms the first match before applying the rest.</li>
-          <li><b>Download Non-Compliant</b> — generates an .xlsx of every draft line with at least one problem: missing receipt &gt; $25 USD-eq, missing account, missing category, or internal-employee gift (Meal or Event) whose value-per-attendee &gt; $25. Editable columns get <span style="background:#C8E6C9;padding:0 4px;">green headers</span>. Invalid cells light <span style="background:#FF6B6B;color:#fff;padding:0 4px;">red</span> (live conditional formatting).</li>
+          <li><b>Download Non-Compliant</b> — generates an .xlsx of every draft line with at least one problem: missing receipt &gt; $25 USD-eq, missing account, missing category, or gift-meal whose value-per-attendee &gt; $25. Editable columns get <span style="background:#C8E6C9;padding:0 4px;">green headers</span>. Invalid cells light <span style="background:#FF6B6B;color:#fff;padding:0 4px;">red</span> (live conditional formatting).</li>
           <li><b>Export All</b> — same xlsx structure but includes every draft line, not just non-compliant ones. Useful for a complete audit pass.</li>
           <li><b>Upload &amp; Apply</b> — opens a file picker, ingests the edited xlsx, and PATCHes the lines. Compares each row against the line's live state and skips no-op rows. Confirms the first applied change before continuing.</li>
         </ul>
@@ -1579,7 +1642,7 @@
         <h3 style="margin:14px 0 4px 0;color:${accent};">Validation &amp; safety</h3>
         <ul style="margin:0 0 0 18px;padding:0;line-height:1.55;">
           <li>Conditional formatting marks invalid cells red live in Excel; the upload validates the same rules and aborts before any PATCH if it finds one (with a downloadable list of bad cells).</li>
-          <li>Yellow row tint = informational only (internal-employee gift Meal or Event with value-per-attendee &gt; $25). Doesn't block anything.</li>
+          <li>Yellow row tint = informational only (gift-meal value-per-attendee &gt; $25). Doesn't block anything.</li>
           <li>While bulk operations are running, the page warns "Are you sure you want to leave?" if you try to navigate.</li>
           <li>The first PATCH/merge of any bulk action requires confirmation in a modal so you can verify it took before the rest run.</li>
           <li>Counters always reconcile: <code>ok + fail + skipped</code> = total rows the script considered.</li>
