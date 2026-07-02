@@ -7,7 +7,7 @@ A single-file Tampermonkey/Greasemonkey userscript that augments the Coupa expen
 This userscript runs on any `*.coupahost.com` page and injects a persistent top-right control panel plus a filter inside Coupa's "Attach a receipt" dialog. It is a personal productivity tool to speed up cleaning and submitting expense reports in a corporate Coupa tenant (BDP / Philadelphia Finance Systems). It performs the same authenticated API calls the Coupa web app makes (using the page's CSRF token and the user's existing session cookies), so it acts entirely as the logged-in user with no separate credentials.
 
 Core capabilities:
-- **Receipt-dialog filter** — in the "Attach a receipt" modal, converts the expense-line total into USD/EUR/COP/SGD/TRY using live FX rates and hides wallet receipts outside a ±X% tolerance window.
+- **Receipt-dialog filter** — in the "Attach a receipt" modal, converts the expense-line total into USD/EUR/COP/SGD/TRY/PLN using live FX rates and hides wallet receipts outside a ±X% tolerance window.
 - **Apply Account to All** — PATCHes every draft expense line whose account does not already match the configured account.
 - **Account selector** — type-ahead search against Coupa's own account autocomplete; selection stored in `localStorage`.
 - **Match Receipts** — pairs wallet receipts to draft lines using a tiered scoring heuristic (exact amount, ±1% same currency + merchant-token overlap, cross-currency ±12% USD-eq + token overlap) and POSTs `merge_receipt_to_expense_line`.
@@ -16,7 +16,7 @@ Core capabilities:
 
 ## Status
 
-**Working / actively maintained.** Evidence: clean git tree, `main` branch fully pushed (0 ahead / 0 behind origin), 22 commits with a steady semver progression from v0.3.1 (initial commit, Apr 2026) to v0.8.6 (latest, ~2 weeks before audit). Commit messages are descriptive and feature-scoped. The script is 1,858 lines and includes an in-app help modal that matches the implemented behavior. No obvious dead/half-finished features.
+**Working / actively maintained.** Evidence: clean git tree, `main` branch fully pushed (0 ahead / 0 behind origin), steady semver progression from v0.3.1 (initial commit, Apr 2026) to v0.8.7 (latest). Commit messages are descriptive and feature-scoped. The script includes an in-app help modal that matches the implemented behavior. No obvious dead/half-finished features.
 
 ## Technical Requirements
 

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Coupa Receipt Filter (Attach Receipt dialog, ±% across currencies)
 // @namespace    local.tylerkeller
-// @version      0.8.6
+// @version      0.8.7
 // @description  Filter the Coupa "Attach a receipt" dialog by ±X%, plus a top-right panel with Apply-Account-to-All, Download-Problems (xlsx with red/yellow row highlights AND conditional formatting on invalid entries), and Upload-and-Apply (description + attendee bulk edit with first-line confirmation + progress bar).
 // @match        https://*.coupahost.com/*
 // @run-at       document-idle
@@ -42,7 +42,7 @@
     localStorage.removeItem(ACTIVE_ACCOUNT_LSKEY);
   }
 
-  const SCRIPT_VERSION = '0.8.6';
+  const SCRIPT_VERSION = '0.8.7';
   // Palette used to randomize the help-modal accent color each open
   const HELP_PALETTE = [
     { fg: '#1976D2', name: 'blue' },
@@ -165,7 +165,7 @@
     return excelJsPromise;
   }
 
-  const TARGETS = ['USD', 'EUR', 'COP', 'SGD', 'TRY'];
+  const TARGETS = ['USD', 'EUR', 'COP', 'SGD', 'TRY', 'PLN'];
   const DEFAULT_TOL_PCT = 5;
   const FX_URL = 'https://open.er-api.com/v6/latest/USD';
   const FX_TTL_MS = 60 * 60 * 1000;
