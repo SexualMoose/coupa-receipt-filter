@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Coupa Receipt Filter (Attach Receipt dialog, ±% across currencies)
 // @namespace    local.tylerkeller
-// @version      0.8.7
-// @description  Filter the Coupa "Attach a receipt" dialog by ±X%, plus a top-right panel with Apply-Account-to-All, Download-Problems (xlsx with red/yellow row highlights AND conditional formatting on invalid entries), and Upload-and-Apply (description + attendee bulk edit with first-line confirmation + progress bar).
+// @version      0.9.0
+// @description  Filter the Coupa "Attach a receipt" dialog by ±X%, plus a top-right panel with Apply-Account-to-All, Download-Problems (xlsx with red/yellow row highlights AND conditional formatting on invalid entries), and Upload-and-Apply (description + category + currency + attendee bulk edit with first-line confirmation + progress bar).
 // @match        https://*.coupahost.com/*
 // @run-at       document-idle
 // @grant        GM_xmlhttpRequest
@@ -42,7 +42,7 @@
     localStorage.removeItem(ACTIVE_ACCOUNT_LSKEY);
   }
 
-  const SCRIPT_VERSION = '0.8.7';
+  const SCRIPT_VERSION = '0.9.0';
   // Palette used to randomize the help-modal accent color each open
   const HELP_PALETTE = [
     { fg: '#1976D2', name: 'blue' },
@@ -118,6 +118,14 @@
     { id: 49, name: 'WIFI' },
   ];
   const NEW_ATTENDEE_TYPE_ID = 6;   // "BDP Employee (manual entry)"
+
+  // Sentinel header for the "example" attendee column we append to every export.
+  // Its ONLY job is to teach the user the exact header format for adding a brand-new
+  // attendee. If the user leaves this header untouched (or deletes the column), the
+  // uploader ignores the column entirely. If the user renames it to a real person's
+  // name (e.g. "Jane Smith") and marks rows with "x", the uploader creates that
+  // attendee and attaches them — no Attendees-sheet edit required.
+  const EXAMPLE_ATTENDEE_HEADER = 'Firstname Lastname (example — rename or delete)';
 
   let excelJsPromise = null;
   function getExcelJS() {
@@ -619,6 +627,31 @@
     return list;
   }
 
+  // Coupa needs a numeric currency *id* to change a line's currency (the PATCH field
+  // expense_line[receipt_total_currency_id]) — a plain ISO code like "EUR" is not
+  // enough, and the ids are tenant-specific (only USD=1 is standard). There's no
+  // hard-coded currency catalog, so we harvest every {code,id} pair that appears on
+  // the user's own draft lines (receipt_currency + amount_to_receive_currency). This
+  // reliably covers the realistic case: re-tagging a line to a currency the user
+  // already transacts in. Currencies with no discoverable id can't be offered.
+  function collectCurrencyDirectory(reports) {
+    const seen = new Map(); // CODE -> { code, id }
+    const add = (cur) => {
+      if (!cur) return;
+      const code = (cur.code || '').trim().toUpperCase();
+      const id = cur.id;
+      if (!code || id == null) return;
+      if (!seen.has(code)) seen.set(code, { code, id });
+    };
+    reports.forEach(r => (r.expense_lines || []).forEach(l => {
+      add(l.receipt_currency);
+      add(l.amount_to_receive_currency);
+    }));
+    const list = Array.from(seen.values());
+    list.sort((a, b) => a.code.localeCompare(b.code));
+    return list;
+  }
+
   async function buildProblemsWorkbook(panel, opts) {
     const onlyProblems = !opts || opts.onlyProblems !== false;
     const status = panel.querySelector('.__rf_acct_status');
@@ -657,6 +690,7 @@
   async function _buildWorkbookInner(ExcelJS, reports, usdRates, status, panel, onlyProblems) {
 
     const attendees = collectAttendeeDirectory(reports);
+    const currencies = collectCurrencyDirectory(reports);
     // Dropdown/validator must offer the FULL Coupa catalog so a line can be
     // re-classified into any category, not only the ~4 already in use. Union the
     // embedded catalog with anything actually on the data (in case the tenant adds
@@ -678,34 +712,53 @@
     catSh.addRow(['name', 'id']);
     dropdownCategories.forEach(c => catSh.addRow([c.name, c.id]));
 
+    // Hidden helper sheet mapping currency CODE -> currency id. Drives the
+    // new_currency dropdown + CF on Lines, and is re-read by the uploader to
+    // translate a chosen code back into the id Coupa's PATCH needs.
+    const curSh = wb.addWorksheet('_currencies', { state: 'veryHidden' });
+    curSh.addRow(['code', 'id']);
+    currencies.forEach(c => curSh.addRow([c.code, c.id]));
+
     const sh = wb.addWorksheet('Lines');
-    // Column order:
-    // A line_id, B report_title, C merchant, D date, E amount, F currency, G usd_eq,
-    // H current_category, I new_category (EDITABLE+dropdown),
-    // J problems, K current_description, L new_description (EDITABLE),
-    // M current_attendees, N+ attendee columns (EDITABLE)
+    // Column order (1-indexed):
+    //  1 A line_id, 2 B report_title, 3 C merchant, 4 D date, 5 E amount,
+    //  6 F currency, 7 G new_currency (EDITABLE+dropdown), 8 H usd_eq,
+    //  9 I current_category, 10 J new_category (EDITABLE+dropdown),
+    // 11 K problems, 12 L current_description, 13 M new_description (EDITABLE),
+    // 14 N current_attendees, 15 O.. attendee columns (EDITABLE),
+    // then one trailing EXAMPLE attendee column (EDITABLE) that teaches how to add a new person.
+    const attendeeHeaders = attendees.map(a => `${a.first_name} ${a.last_name} (${a.id})`);
     const headers = [
-      'line_id', 'report_title', 'merchant', 'date', 'amount', 'currency', 'usd_eq',
+      'line_id', 'report_title', 'merchant', 'date', 'amount', 'currency', 'new_currency', 'usd_eq',
       'current_category', 'new_category',
       'problems', 'current_description', 'new_description',
       'current_attendees',
-    ].concat(attendees.map(a => `${a.first_name} ${a.last_name} (${a.id})`));
+    ].concat(attendeeHeaders).concat([EXAMPLE_ATTENDEE_HEADER]);
+    // Column index of the trailing example-attendee column (always the last column).
+    const EXAMPLE_COL = headers.length;
     sh.addRow(headers);
     sh.getRow(1).font = { bold: true };
     sh.views = [{ state: 'frozen', ySplit: 1, xSplit: 4 }];
-    [10, 32, 28, 10, 10, 7, 10, 24, 24, 28, 26, 28, 30].forEach((w, i) => {
+    [10, 32, 28, 10, 10, 7, 12, 10, 24, 24, 28, 26, 28, 30].forEach((w, i) => {
       sh.getColumn(i + 1).width = w;
     });
-    const ATTENDEE_COL_START = 14; // column N
+    const ATTENDEE_COL_START = 15; // column O (first real attendee column)
     for (let i = ATTENDEE_COL_START; i <= headers.length; i++) sh.getColumn(i).width = 8;
+    sh.getColumn(EXAMPLE_COL).width = 26; // give the example column room to show its instructional header
 
-    // Green headers on editable columns: I (new_category), L (new_description), N..end (attendees)
-    const editableHeaderCols = [9, 12]; // I, L
+    // Green headers on editable columns: G (new_currency), J (new_category), M (new_description), O..end (attendees + example).
+    const editableHeaderCols = [7, 10, 13];
     for (let c = ATTENDEE_COL_START; c <= headers.length; c++) editableHeaderCols.push(c);
     editableHeaderCols.forEach(c => {
       const cell = sh.getRow(1).getCell(c);
       cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: GREEN_HDR } };
     });
+    // Explain the example column right on its header so it's self-documenting.
+    try {
+      sh.getRow(1).getCell(EXAMPLE_COL).note = {
+        texts: [{ text: 'Example "add a new attendee" column.\n\n• Leave this header unchanged (or delete the whole column) → it is ignored on upload.\n• To add a brand-new attendee: rename this header to their real name in "Firstname Lastname" form, then put x in the rows they attended. The uploader will create the attendee and attach them.\n\nNo Attendees-sheet edit is required.' }],
+      };
+    } catch (e) { /* notes are best-effort */ }
 
     let problemRows = 0;
     reports.forEach(rpt => {
@@ -719,15 +772,17 @@
           l.id, rpt.title, l.merchant || '', l.local_expense_date || '',
           parseFloat(l.receipt_amount) || '',
           (l.receipt_currency?.code || '').toUpperCase(),
+          '', // new_currency (editable, blank by default)
           isFinite(usdEq) ? Number(usdEq.toFixed(2)) : '',
           l.expense_category_name || '',
           '', // new_category (editable, blank by default)
           problems.join(', '),
           l.description || '',
-          '',
+          '', // new_description (editable, blank by default)
           currentAttendees,
         ];
         attendees.forEach(a => row.push(attIds.has(a.id) ? 'x' : ''));
+        row.push(''); // trailing example-attendee column (blank by default; ignored unless renamed)
         const r = sh.addRow(row);
 
         // Only keep YELLOW row tint for gift-meal-per-attendee>$25 rows.
@@ -741,15 +796,16 @@
       });
     });
 
-    // ----- Data validation for new_category dropdown (col I) -----
+    // ----- Data validation dropdowns (new_category col J, new_currency col G) -----
     // Excel inline dropdown limit is ~255 chars when using a literal list; for safety,
-    // reference the hidden _categories sheet's range instead.
+    // reference the hidden helper sheets' ranges instead.
     try {
+      const lastDataRow = Math.max(2, problemRows + 1);
       const catRows = dropdownCategories.length;
-      if (catRows > 0) {
-        const lastDataRow = Math.max(2, problemRows + 1);
-        for (let r = 2; r <= lastDataRow; r++) {
-          sh.getCell(`I${r}`).dataValidation = {
+      const curRows = currencies.length;
+      for (let r = 2; r <= lastDataRow; r++) {
+        if (catRows > 0) {
+          sh.getCell(`J${r}`).dataValidation = {
             type: 'list',
             allowBlank: true,
             formulae: [`_categories!$A$2:$A$${catRows + 1}`],
@@ -759,30 +815,53 @@
             error: 'Use the dropdown to pick a valid category. Leave blank to keep current.',
           };
         }
+        if (curRows > 0) {
+          sh.getCell(`G${r}`).dataValidation = {
+            type: 'list',
+            allowBlank: true,
+            formulae: [`_currencies!$A$2:$A$${curRows + 1}`],
+            showErrorMessage: true,
+            errorStyle: 'error',
+            errorTitle: 'Invalid currency',
+            error: 'Pick a currency from the dropdown. Only currencies already used somewhere on your reports can be set (Coupa needs their internal id). Leave blank to keep current.',
+          };
+        }
       }
-    } catch (e) { console.warn('[CoupaReceiptFilter] new_category dropdown skipped:', e); }
+    } catch (e) { console.warn('[CoupaReceiptFilter] dropdown validation skipped:', e); }
 
     // ----- Conditional formatting on Lines -----
     // Red on:
-    //   - new_category (I): non-empty AND not present in _categories!A:A
-    //   - any attendee column (N+): non-empty AND not "x"/"X"
+    //   - new_currency (G): non-empty AND not present in _currencies!A:A
+    //   - new_category (J): non-empty AND not present in _categories!A:A
+    //   - any attendee column (O+): non-empty AND not "x"/"X"
+    const RED_STYLE = {
+      fill: { type: 'pattern', pattern: 'solid', bgColor: { argb: 'FFFF6B6B' } },
+      font: { color: { argb: 'FFFFFFFF' }, bold: true },
+    };
     try {
       const colLetter = (n) => {
         let s = '';
         while (n > 0) { const r = (n - 1) % 26; s = String.fromCharCode(65 + r) + s; n = Math.floor((n - 1) / 26); }
         return s;
       };
-      // CF: new_category invalid (referencing helper sheet)
+      // CF: new_currency invalid (referencing helper sheet)
       sh.addConditionalFormatting({
-        ref: 'I2:I10000',
+        ref: 'G2:G10000',
         rules: [{
           type: 'expression',
           priority: 1,
-          formulae: ['AND(LEN(I2)>0, COUNTIF(_categories!$A:$A, I2)=0)'],
-          style: {
-            fill: { type: 'pattern', pattern: 'solid', bgColor: { argb: 'FFFF6B6B' } },
-            font: { color: { argb: 'FFFFFFFF' }, bold: true },
-          },
+          formulae: ['AND(LEN(G2)>0, COUNTIF(_currencies!$A:$A, G2)=0)'],
+          style: RED_STYLE,
+        }],
+      });
+      // CF: new_category invalid (referencing helper sheet)
+      sh.addConditionalFormatting({
+        ref: 'J2:J10000',
+        rules: [{
+          type: 'expression',
+          priority: 1,
+          formulae: ['AND(LEN(J2)>0, COUNTIF(_categories!$A:$A, J2)=0)'],
+          style: RED_STYLE,
         }],
       });
       // CF: attendee columns invalid
@@ -815,7 +894,7 @@
     // Attach instructions as a header-cell comment so it doesn't pollute the data area.
     try {
       ash.getCell('A1').note = {
-        texts: [{ text: 'To add a NEW attendee: append a row with id BLANK, type_id blank (defaults to 6), set first_name and last_name. Then add a column header "first last" on the Lines sheet to mark X.' }],
+        texts: [{ text: 'Easiest way to add a NEW attendee: on the Lines sheet, rename the last (example) column to the person\'s name in "Firstname Lastname" form and mark x on their rows — the uploader creates + attaches them automatically.\n\nAdvanced: you can instead append a row here with id BLANK, type_id blank (defaults to 6), first_name and last_name, then add a matching "First Last" column header on the Lines sheet to mark X.' }],
       };
     } catch (e) { /* fall back: no comment */ }
 
@@ -893,6 +972,7 @@
     const COL_LINE_ID = colIdx('line_id');
     const COL_NEW_DESC = colIdx('new_description');
     const COL_NEW_CAT = colIdx('new_category');
+    const COL_NEW_CURRENCY = colIdx('new_currency'); // 0 for workbooks made before v0.9.0
     if (!COL_LINE_ID || !COL_NEW_DESC) throw new Error('Required columns not found.');
     // Attendee columns are anything after current_attendees
     const attendeeColStart = colIdx('current_attendees') + 1;
@@ -913,6 +993,44 @@
       });
     }
 
+    // Build currency CODE -> id map from the hidden _currencies helper sheet. Unlike
+    // categories there is NO embedded catalog to fall back on (currency ids are
+    // tenant-specific), so an older workbook without this sheet simply can't set a
+    // currency — any non-blank new_currency will be flagged with a clear message.
+    const currencyCodeToId = new Map();
+    const curHelper = wb.getWorksheet('_currencies');
+    if (curHelper) {
+      curHelper.eachRow({ includeEmpty: false }, (row, idx) => {
+        if (idx === 1) return;
+        const code = row.getCell(1).value;
+        const id = row.getCell(2).value;
+        if (code != null && String(code).trim() !== '' && id != null) {
+          currencyCodeToId.set(String(code).trim().toUpperCase(), Number(id));
+        }
+      });
+    }
+
+    // Attendees invented on-the-fly from a renamed example column (or any user-added
+    // "First Last" column header not already in the directory). Deduped by normalized
+    // name so the same person across rows/columns collapses to one create. Pushed into
+    // `attendees` so ensureAttendeeIds() creates them before we attach.
+    const newAttendeeByName = new Map();
+    const getOrCreateNewAttendee = (first, last) => {
+      const key = `${first} ${last}`.trim().toLowerCase();
+      let rec = newAttendeeByName.get(key);
+      if (!rec) {
+        rec = { id: null, type_id: NEW_ATTENDEE_TYPE_ID, first_name: first, last_name: last };
+        newAttendeeByName.set(key, rec);
+        attendees.push(rec);
+      }
+      return rec;
+    };
+    const parseNameHeader = (label) => {
+      const parts = String(label).trim().split(/\s+/).filter(Boolean);
+      if (parts.length < 2) return null; // need at least a first and a last name
+      return { first: parts[0], last: parts.slice(1).join(' ') };
+    };
+
     const changes = [];
     const colLet = (n) => { let s = ''; while (n > 0) { const r = (n - 1) % 26; s = String.fromCharCode(65 + r) + s; n = Math.floor((n - 1) / 26); } return s; };
     linesSheet.eachRow({ includeEmpty: false }, (row, idx) => {
@@ -932,27 +1050,59 @@
           validationErrors.push(`Lines!${colLet(COL_NEW_CAT)}${idx}: new_category "${trimmed}" not in dropdown list`);
         }
       }
+      // new_currency: translate the chosen code back into the tenant currency id.
+      const newCurRaw = COL_NEW_CURRENCY ? row.getCell(COL_NEW_CURRENCY).value : null;
+      let newCurrencyId = null;
+      let newCurrencyCode = null;
+      if (newCurRaw != null && String(newCurRaw).trim() !== '') {
+        const code = String(newCurRaw).trim().toUpperCase();
+        if (currencyCodeToId.has(code)) {
+          newCurrencyId = currencyCodeToId.get(code);
+          newCurrencyCode = code;
+        } else {
+          validationErrors.push(`Lines!${colLet(COL_NEW_CURRENCY)}${idx}: new_currency "${code}" can't be set — it's not in this workbook's currency list. Re-download the workbook, or pick a currency already used somewhere on your reports.`);
+        }
+      }
       const markedAttendees = [];
       for (let c = attendeeColStart; c <= headers.length; c++) {
+        const label = String(headers[c - 1] == null ? '' : headers[c - 1]).trim();
+        // The trailing example column only teaches the header format. If the user left
+        // it unrenamed (or typed anything into it without renaming), ignore it wholesale.
+        if (label === EXAMPLE_ATTENDEE_HEADER) continue;
         const v = row.getCell(c).value;
         if (v == null || v === '') continue;
         const sv = String(v).trim();
-        if (sv.toLowerCase() === 'x') {
-          const label = headers[c - 1];
-          const att = labelToAttendee.get(label);
-          if (att) markedAttendees.push(att);
-          else validationErrors.push(`Lines!${colLet(c)}${idx}: attendee column header "${label}" not found in Attendees sheet`);
-        } else {
+        if (sv.toLowerCase() !== 'x') {
           // Anything other than empty or 'x' is an invalid mark
           validationErrors.push(`Lines!${colLet(c)}${idx}: invalid value "${sv}" (must be blank or "x")`);
+          continue;
         }
+        // 1) A known attendee: a directory column, or a name matching an Attendees-sheet row.
+        const known = labelToAttendee.get(label);
+        if (known) { markedAttendees.push(known); continue; }
+        // 2) A header still carrying an "(id)" suffix is a directory column — if it isn't
+        //    found, it's been corrupted/typo'd. Fail loudly instead of inventing a person.
+        if (/\(\d+\)\s*$/.test(label)) {
+          validationErrors.push(`Lines!${colLet(c)}${idx}: attendee column header "${label}" not found in Attendees sheet`);
+          continue;
+        }
+        // 3) Otherwise this is a user-named column (e.g. a renamed example column) →
+        //    create + attach a brand-new attendee from the "Firstname Lastname" header.
+        const nm = parseNameHeader(label);
+        if (!nm) {
+          validationErrors.push(`Lines!${colLet(c)}${idx}: attendee column header "${label}" must be a full name like "Jane Smith"`);
+          continue;
+        }
+        markedAttendees.push(getOrCreateNewAttendee(nm.first, nm.last));
       }
-      if ((newDesc && String(newDesc).trim()) || markedAttendees.length || newCategoryId) {
+      if ((newDesc && String(newDesc).trim()) || markedAttendees.length || newCategoryId || newCurrencyId) {
         changes.push({
           line_id: lineId,
           new_description: newDesc ? String(newDesc).trim() : null,
           new_category_id: newCategoryId,
           new_category_name: newCategoryName,
+          new_currency_id: newCurrencyId,
+          new_currency_code: newCurrencyCode,
           attendees: markedAttendees,
         });
       }
@@ -1006,11 +1156,23 @@
     const finalIds = Array.from(new Set([...existingIds, ...newIds]));
     const u = new URLSearchParams();
     const set = (k, v) => u.append(k, v == null ? '' : String(v));
+    // ---- currency change (only ever reaches here for single-currency lines; cross-
+    // currency lines are filtered out in applyUpload because we can't recompute Coupa's
+    // official FX rate). When re-tagging such a line we keep the whole line in ONE
+    // currency: move the reimbursement (foreign) side to the same new code at rate 1 so
+    // the payload can never carry a stale non-1 rate or mismatched amounts. Lines with
+    // no reimbursement-currency tracking keep their empty foreign fields. ----
+    const chgCur = change.new_currency_id != null;
+    const hadForeign = line.amount_to_receive_currency?.id != null && line.amount_to_receive_currency?.id !== '';
+    const receiptCurId = chgCur ? change.new_currency_id : (line.receipt_currency?.id ?? '');
+    const foreignCurId = (chgCur && hadForeign) ? change.new_currency_id : (line.amount_to_receive_currency?.id ?? '');
+    const exchangeRate = (chgCur && hadForeign) ? 1 : (line.exchange_rate ?? '');
+    const foreignAmt   = (chgCur && hadForeign) ? (line.receipt_amount ?? '') : (line.amount_to_receive ?? '');
     set('expense_line[custom_field_3]', line.custom_field_3 ?? '');
     set('expense_line[travel_provider_type]', line.travel_provider_type ?? '');
     set('expense_line[audit_status_id]', line.audit_status_id ?? '');
     set('expense_line[reason]', line.reason ?? '');
-    set('expense_line[amount_to_receive]', line.amount_to_receive ?? '');
+    set('expense_line[amount_to_receive]', foreignAmt);
     // preserve line's existing account if any
     const acct = (line.accounts || [])[0];
     set('expense_line[account_id]', acct ? acct.account_id : '');
@@ -1024,15 +1186,18 @@
     set('expense_line[expense_category_id]', change.new_category_id != null ? change.new_category_id : (line.expense_category_id ?? ''));
     set('expense_line[employee_reimbursable]', line.employee_reimbursable ? 'true' : 'false');
     set('expense_line[expense_category_custom_field_1]', line.expense_category_custom_field_1 ?? '');
-    set('expense_line[receipt_total_currency_id]', line.receipt_currency?.id ?? '');
-    set('expense_line[foreign_currency_id]', line.amount_to_receive_currency?.id ?? '');
+    // Currency change (if requested) re-tags the receipt currency; the numeric receipt
+    // amount is left as-is, matching a "fix the currency I picked" edit. The foreign
+    // (reimbursement) side + rate are derived above to stay consistent.
+    set('expense_line[receipt_total_currency_id]', receiptCurId);
+    set('expense_line[foreign_currency_id]', foreignCurId);
     set('expense_line[external_src_name]', line.external_src_name ?? '');
-    set('expense_line[exchange_rate]', line.exchange_rate ?? '');
+    set('expense_line[exchange_rate]', exchangeRate);
     set('expense_line[description]', change.new_description != null ? change.new_description : (line.description ?? ''));
     set('expense_line[employee_reimbursable_overridden]', line.employee_reimbursable_overridden ? 'true' : 'false');
     set('expense_line[divisor]', line.divisor ?? '');
     set('expense_line[receipt_total_amount]', line.receipt_amount ?? '');
-    set('expense_line[foreign_currency_amount]', line.amount_to_receive ?? '');
+    set('expense_line[foreign_currency_amount]', foreignAmt);
     set('expense_line[expense_report_id]', line.expense_report_id ?? '');
     set('expense_line[custom_field_2]', line.custom_field_2 ? 'true' : 'false');
     finalIds.forEach(id => u.append('expense_line[attendee_ids][]', id));
@@ -1125,13 +1290,27 @@
       const noOp = (line, ch) => {
         if (ch.new_description != null && !sameStr(ch.new_description, line.description)) return false;
         if (ch.new_category_id != null && Number(ch.new_category_id) !== Number(line.expense_category_id)) return false;
+        if (ch.new_currency_id != null && Number(ch.new_currency_id) !== Number(line.receipt_currency?.id)) return false;
         const existingIds = new Set((line.expense_attendees || []).map(a => a.id));
         const additions = (ch.attendees || []).map(a => a.id).filter(id => id != null && !existingIds.has(id));
         if (additions.length > 0) return false;
         return true;
       };
+      // A currency edit is only safe on a SINGLE-currency line. A line that tracks a
+      // distinct reimbursement currency (or carries a non-1 FX rate) can't be re-tagged
+      // by us without recomputing Coupa's official cross-currency rate — which we can't
+      // do — so we refuse those and tell the user to change them in Coupa directly.
+      const isCrossCurrency = (line) => {
+        const fId = line.amount_to_receive_currency?.id;
+        const rId = line.receipt_currency?.id;
+        if (fId != null && fId !== '' && Number(fId) !== Number(rId)) return true;
+        const rate = line.exchange_rate;
+        if (rate != null && rate !== '' && Number(rate) !== 1) return true;
+        return false;
+      };
       const realChanges = [];
       const skippedNoOp = [];
+      const currencySkipped = [];
       for (const ch of changes) {
         const line = await findLineById(reports, ch.line_id);
         if (!line) { realChanges.push(ch); continue; } // let it fail loudly later
@@ -1149,13 +1328,29 @@
           trimmed.new_category_id = ch.new_category_id;
           trimmed.new_category_name = ch.new_category_name;
         }
+        if (ch.new_currency_id != null && Number(ch.new_currency_id) !== Number(line.receipt_currency?.id)) {
+          if (isCrossCurrency(line)) {
+            currencySkipped.push(ch.line_id);
+          } else {
+            trimmed.new_currency_id = ch.new_currency_id;
+            trimmed.new_currency_code = ch.new_currency_code;
+          }
+        }
         const existingIds = new Set((line.expense_attendees || []).map(a => a.id));
         trimmed.attendees = (ch.attendees || []).filter(a => a.id != null && !existingIds.has(a.id));
+        // If the only requested change was a refused cross-currency edit, there's
+        // nothing left to PATCH — don't emit an all-original no-op PATCH.
+        const hasEffect = trimmed.new_description != null || trimmed.new_category_id != null
+          || trimmed.new_currency_id != null || (trimmed.attendees && trimmed.attendees.length);
+        if (!hasEffect) continue;
         realChanges.push(trimmed);
       }
 
+      const curSkipNote = currencySkipped.length
+        ? ` ${currencySkipped.length} cross-currency line(s) refused a currency change (${currencySkipped.join(', ')}) — change those in Coupa directly.`
+        : '';
       if (!realChanges.length) {
-        status.textContent = `No changes to apply — ${skippedNoOp.length} row(s) were already in the desired state.`;
+        status.textContent = `No changes to apply — ${skippedNoOp.length} row(s) were already in the desired state.` + curSkipNote;
         return;
       }
 
@@ -1171,9 +1366,12 @@
       if (!r.ok) { status.textContent = `First PATCH failed (status ${r.status}). Aborting.`; return; }
       const summary =
         `<b>Line ${first.line_id}</b> &mdash; ${escapeHtml(firstLine.merchant || '')}<br>` +
+        (first.new_currency_code ? `&bull; currency set to: <i>${escapeHtml(first.new_currency_code)}</i><br>` : '') +
         (first.new_category_name ? `&bull; category set to: <i>${escapeHtml(first.new_category_name)}</i><br>` : '') +
         (first.new_description ? `&bull; description set to: <i>${escapeHtml(first.new_description)}</i><br>` : '') +
         (first.attendees && first.attendees.length ? `&bull; attendees added: ${first.attendees.map(a => escapeHtml(a.first_name + ' ' + a.last_name)).join(', ')}<br>` : '') +
+        (first.new_currency_code ? `<div style="color:#a60;font-size:11px;margin-top:6px;">Currency was changed — open this line in Coupa and confirm the amount &amp; any reimbursement/exchange values look right before applying the rest.</div>` : '') +
+        (currencySkipped.length ? `<div style="color:#a60;font-size:11px;margin-top:4px;">${currencySkipped.length} cross-currency line(s) refused a currency change (${escapeHtml(currencySkipped.join(', '))}); change those in Coupa directly.</div>` : '') +
         (skippedNoOp.length ? `<div style="color:#888;font-size:11px;margin-top:6px;">(${skippedNoOp.length} other row(s) were already up-to-date and will be skipped.)</div>` : '');
       const ok = await showFirstLineConfirm(panel, summary);
       if (!ok) {
@@ -1205,7 +1403,7 @@
         await new Promise(r => setTimeout(r, 120));
       }
 
-      status.innerHTML = `<b>Done.</b> ok=${okCount} / fail=${failCount} / no-op skipped=${skippedNoOp.length}` +
+      status.innerHTML = `<b>Done.</b> ok=${okCount} / fail=${failCount} / no-op skipped=${skippedNoOp.length}` + escapeHtml(curSkipNote) +
         (failures.length ? ` <a href="data:application/json;base64,${btoa(JSON.stringify(failures, null, 2))}" download="upload-apply-failures.json" style="color:#06c;">download failures</a>` : '');
       progressBar.style.background = failCount > 0 ? '#c60' : '#0a7';
     } catch (e) {
@@ -1630,14 +1828,15 @@
         <h3 style="margin:14px 0 4px 0;color:${accent};">Workbook layout (Lines sheet)</h3>
         <ul style="margin:0 0 0 18px;padding:0;line-height:1.55;">
           <li>Read-only context: <code>line_id, report, merchant, date, amount, currency, usd_eq, current_category, problems, current_description, current_attendees</code>.</li>
-          <li>Editable (green header): <code>new_category</code> (dropdown of categories you've used), <code>new_description</code> (free text), <code>&lt;person&gt;</code> attendee columns (mark <code>x</code> to add).</li>
-          <li>Hidden helper sheet <code>_categories</code> drives both the dropdown and the upload's name→id resolution. Don't delete it.</li>
+          <li>Editable (green header): <code>new_currency</code> (dropdown of currencies you've used — leave blank to keep current; applied only to single-currency lines, cross-currency lines are refused and reported), <code>new_category</code> (dropdown of categories you've used), <code>new_description</code> (free text), <code>&lt;person&gt;</code> attendee columns (mark <code>x</code> to add).</li>
+          <li>Last column is an <b>example attendee</b> column headed <code>"${escapeHtml(EXAMPLE_ATTENDEE_HEADER)}"</code>. Rename it to a real <code>"Firstname Lastname"</code> and mark <code>x</code> to create + attach a brand-new attendee. Leave it unchanged (or delete it) and the upload ignores it.</li>
+          <li>Hidden helper sheets <code>_categories</code> and <code>_currencies</code> drive the dropdowns and the upload's name/code→id resolution. Don't delete them.</li>
         </ul>
         <h3 style="margin:14px 0 4px 0;color:${accent};">Workbook layout (Attendees sheet)</h3>
         <ul style="margin:0 0 0 18px;padding:0;line-height:1.55;">
           <li>Existing attendees you've used appear with their Coupa <code>id</code>, <code>type_id</code> (5 = Coupa user, 6 = manual entry), <code>first_name</code>, <code>last_name</code>.</li>
-          <li>To add a NEW attendee: append a row, leave <code>id</code> blank, set first &amp; last name. On upload, the script POSTs to <code>/expense_attendees/</code> to create them, then uses the returned id when applying any rows that reference that name.</li>
-          <li>To use a new attendee on a line, you must also add a column on Lines named <code>"first last"</code> (without an id) and put <code>x</code> in the row.</li>
+          <li>Easiest way to add a NEW attendee: rename the example column on the Lines sheet and mark <code>x</code> — no edit here needed. On upload the script POSTs to <code>/expense_attendees/</code> to create them, then uses the returned id when applying.</li>
+          <li>Advanced: append a row here (blank <code>id</code>, first &amp; last name) and add a matching <code>"first last"</code> column on Lines. Both paths work.</li>
         </ul>
         <h3 style="margin:14px 0 4px 0;color:${accent};">Validation &amp; safety</h3>
         <ul style="margin:0 0 0 18px;padding:0;line-height:1.55;">

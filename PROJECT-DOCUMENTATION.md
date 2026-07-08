@@ -1,6 +1,6 @@
 # Coupa Receipt Filter
 
-A single-file Tampermonkey/Greasemonkey userscript that augments the Coupa expense UI with bulk-edit tooling: receipt-dialog filtering by ±% across currencies, bulk account assignment, receipt-to-line matching, and an xlsx round-trip for editing categories / descriptions / attendees on draft expense reports.
+A single-file Tampermonkey/Greasemonkey userscript that augments the Coupa expense UI with bulk-edit tooling: receipt-dialog filtering by ±% across currencies, bulk account assignment, receipt-to-line matching, and an xlsx round-trip for editing categories / currencies / descriptions / attendees on draft expense reports.
 
 ## Overview / Purpose
 
@@ -12,11 +12,13 @@ Core capabilities:
 - **Account selector** — type-ahead search against Coupa's own account autocomplete; selection stored in `localStorage`.
 - **Match Receipts** — pairs wallet receipts to draft lines using a tiered scoring heuristic (exact amount, ±1% same currency + merchant-token overlap, cross-currency ±12% USD-eq + token overlap) and POSTs `merge_receipt_to_expense_line`.
 - **Download Non-Compliant / Export All** — generates an `.xlsx` (via ExcelJS) of draft lines with conditional formatting highlighting problems (missing receipt > $25 USD-eq, missing account/category, gift-meal value-per-attendee > $25).
-- **Upload & Apply** — ingests the edited xlsx and PATCHes lines (category, description, attendees), creating new attendees via `/expense_attendees/` when needed. Skips no-op rows and confirms the first change before bulk-applying.
+- **Upload & Apply** — ingests the edited xlsx and PATCHes lines (category, **currency**, description, attendees), creating new attendees via `/expense_attendees/` when needed. Skips no-op rows and confirms the first change before bulk-applying.
+  - **Currency edit:** an editable `new_currency` column (dropdown) lets you re-tag a line's receipt currency. Because Coupa's PATCH needs the tenant's numeric currency **id** (not just the ISO code, and ids are tenant-specific), only currencies already present somewhere on your own draft lines can be set — these are harvested into a hidden `_currencies` helper sheet and translated back to ids on upload. The numeric receipt amount is left as-is (a "fix the currency I picked" edit), and the reimbursement/foreign side is moved to match at rate 1 so the line stays internally consistent. **Safety:** currency edits are applied only to single-currency lines; a genuinely cross-currency line (a distinct reimbursement currency / non-1 FX rate) is **refused** and reported, because the tool can't recompute Coupa's official cross-currency rate — change those in Coupa directly. The mandatory first-line confirmation also flags currency changes so you can verify the amounts before bulk-applying.
+  - **Example attendee column:** every export ends with one placeholder column (`Firstname Lastname (example — rename or delete)`). Leave it unchanged or delete it → the upload ignores it. Rename it to a real `Firstname Lastname` and mark `x` → the upload creates that attendee and attaches them (no Attendees-sheet edit required).
 
 ## Status
 
-**Working / actively maintained.** Evidence: clean git tree, `main` branch fully pushed (0 ahead / 0 behind origin), steady semver progression from v0.3.1 (initial commit, Apr 2026) to v0.8.7 (latest). Commit messages are descriptive and feature-scoped. The script includes an in-app help modal that matches the implemented behavior. No obvious dead/half-finished features.
+**Working / actively maintained.** Evidence: steady semver progression from v0.3.1 (initial commit, Apr 2026) through v0.8.7 to **v0.9.0** (adds `new_currency` editing + the example-attendee column). Commit messages are descriptive and feature-scoped. The script includes an in-app help modal that matches the implemented behavior. No obvious dead/half-finished features.
 
 ## Technical Requirements
 
@@ -54,7 +56,7 @@ There is no build step. "Running" = having the userscript installed and active w
 On a **draft** expense report page:
 - Use the top-right panel buttons: Apply Account to All, Match Receipts, Download Non-Compliant, Export All, Upload & Apply, and the account search box (with ↺ reset).
 - For the receipt filter: open Coupa's "Attach a receipt" dialog, set the ± tolerance %, and the script hides receipts outside the converted-amount window.
-- For the xlsx round-trip: Download Non-Compliant → edit green-header columns (`new_category`, `new_description`, attendee `x` marks) in Excel → Upload & Apply. The hidden `_categories` helper sheet drives the dropdown and name→id resolution; do not delete it.
+- For the xlsx round-trip: Download Non-Compliant → edit green-header columns (`new_currency`, `new_category`, `new_description`, attendee `x` marks, and the trailing example-attendee column) in Excel → Upload & Apply. The hidden `_categories` and `_currencies` helper sheets drive the dropdowns and name/code→id resolution; do not delete them.
 - Click the "?" / help link in the panel footer for the built-in help modal.
 
 ## Architecture
