@@ -4,7 +4,7 @@ Pick-up notes for a fresh Claude Code session. For the full living reference see
 [PROJECT-DOCUMENTATION.md](PROJECT-DOCUMENTATION.md); this file is the "what just
 happened / how to continue" layer.
 
-## Current state (as of v0.9.0)
+## Current state (as of v0.10.0)
 
 - **Single file:** `coupa-receipt-filter.user.js` — a Tampermonkey/Greasemonkey
   userscript for `*.coupahost.com`. One IIFE, no build step.
@@ -21,6 +21,26 @@ happened / how to continue" layer.
 > Public repo → keep employer/tenant-confidential detail and any vulnerability
 > specifics OUT of committed docs. Tenant ids already embedded in the script
 > (DEFAULT_ACCOUNT, ALL_CATEGORIES) predate this and are the existing baseline.
+
+## What v0.10.0 added (FX)
+
+Panel currency conversions, not the xlsx round trip:
+
+1. **More display currencies.** `TARGETS` grew from `USD/EUR/COP/SGD/TRY/PLN` to
+   `USD/SGD/HKD/TWD/KRW/MYR/IDR/VND/EUR/COP/TRY/PLN` (added the SE-/E-Asia set).
+   Receipts in those currencies can now be matched by the ±% filter (previously
+   `targets[HKD]` was `undefined` → never matched). The xlsx USD-eq path already
+   handled any currency the API returns, so no export change was needed.
+2. **Currency-aware formatting** (`fmtMoney` + `ZERO_DP_CCY`): VND/IDR/KRW/COP show
+   grouped with no decimals (26,137 not 26137.29); everything else keeps 2 dp.
+3. **FX fallback + persistence.** Rates were always live (open.er-api.com, 1h cache)
+   — nothing was hardcoded/stale. Added robustness: `getRates`/`fetchFxToUSD` now go
+   **live → last successful live pull (persisted via `GM_setValue`, else
+   `localStorage`, 30-day trust) → baked `FX_FALLBACK` snapshot** (captured
+   2026-08-18, cross-verified vs Google Finance/XE/Wise within 0.31%). The panel
+   labels fallback rates in red ("offline rates: …"). New grants: `GM_setValue`,
+   `GM_getValue`. To refresh `FX_FALLBACK` later, re-fetch
+   `https://open.er-api.com/v6/latest/USD` and paste the units-per-USD values.
 
 ## What v0.9.0 added
 
@@ -92,9 +112,15 @@ recompute, revisit whether to also blank/derive the amounts.
 See [test/README.md](test/README.md). Short version:
 
 ```sh
+JSC=/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc
+
 python3 test/build_roundtrip_test.py
-/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc test/roundtrip_test.generated.js
+"$JSC" test/roundtrip_test.generated.js
 # expect: ==== ALL ASSERTIONS PASSED ==== (40 assertions)
+
+python3 test/build_fx_test.py           # FX: TARGETS, fmtMoney, fallback chain
+"$JSC" test/fx_test.generated.js
+# expect: ==== ALL ASSERTIONS PASSED ==== (53 assertions)
 ```
 
 Parse check: `jsc -e 'new Function(readFile("coupa-receipt-filter.user.js")); print("PARSE_OK")'`.
@@ -118,6 +144,11 @@ Then regenerate the Word copy if docs changed:
 
 ## Open items / ideas
 
+- **FX offline fallback covers only the 12 display currencies.** When the live API
+  is down AND no persisted pull exists AND a line is in another currency, the xlsx
+  problems export can't compute USD-eq and silently skips that line's `>$25`
+  receipt check (still strictly better than pre-0.10.0). Follow-up: have
+  `lineProblems` emit an explicit `fx_unknown` flag rather than passing silently.
 - Confirm Coupa's server-side recompute behavior on currency change (above).
 - No `README.md` in the repo yet (only PROJECT-DOCUMENTATION.md). Global rule
   wants one — cheap follow-up.

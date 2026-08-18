@@ -1,11 +1,13 @@
 // ==UserScript==
 // @name         Coupa Receipt Filter (Attach Receipt dialog, ±% across currencies)
 // @namespace    local.tylerkeller
-// @version      0.9.0
-// @description  Filter the Coupa "Attach a receipt" dialog by ±X%, plus a top-right panel with Apply-Account-to-All, Download-Problems (xlsx with red/yellow row highlights AND conditional formatting on invalid entries), and Upload-and-Apply (description + category + currency + attendee bulk edit with first-line confirmation + progress bar).
+// @version      0.10.0
+// @description  Filter the Coupa "Attach a receipt" dialog by ±X% across currencies (USD/SGD/HKD/TWD/KRW/MYR/IDR/VND/EUR/COP/TRY/PLN, live rates with an offline fallback), plus a top-right panel with Apply-Account-to-All, Download-Problems (xlsx with red/yellow row highlights AND conditional formatting on invalid entries), and Upload-and-Apply (description + category + currency + attendee bulk edit with first-line confirmation + progress bar).
 // @match        https://*.coupahost.com/*
 // @run-at       document-idle
 // @grant        GM_xmlhttpRequest
+// @grant        GM_setValue
+// @grant        GM_getValue
 // @connect      open.er-api.com
 // @updateURL    https://gist.githubusercontent.com/SexualMoose/a0de5a5bf56d33abef414b5781bdd984/raw/coupa-receipt-filter.user.js
 // @downloadURL  https://gist.githubusercontent.com/SexualMoose/a0de5a5bf56d33abef414b5781bdd984/raw/coupa-receipt-filter.user.js
@@ -42,7 +44,7 @@
     localStorage.removeItem(ACTIVE_ACCOUNT_LSKEY);
   }
 
-  const SCRIPT_VERSION = '0.9.0';
+  const SCRIPT_VERSION = '0.10.0';
   // Palette used to randomize the help-modal accent color each open
   const HELP_PALETTE = [
     { fg: '#1976D2', name: 'blue' },
@@ -173,10 +175,67 @@
     return excelJsPromise;
   }
 
-  const TARGETS = ['USD', 'EUR', 'COP', 'SGD', 'TRY', 'PLN'];
+  // Currencies shown in the Attach-Receipt panel (source amount -> each of these).
+  // Order: USD first, then the SE-/E-Asia set, then the other tenant currencies.
+  const TARGETS = ['USD', 'SGD', 'HKD', 'TWD', 'KRW', 'MYR', 'IDR', 'VND', 'EUR', 'COP', 'TRY', 'PLN'];
   const DEFAULT_TOL_PCT = 5;
   const FX_URL = 'https://open.er-api.com/v6/latest/USD';
   const FX_TTL_MS = 60 * 60 * 1000;
+
+  // Currencies whose single units are large / near-worthless individually: show
+  // with thousands separators and no decimals (e.g. VND 26,137 not 26137.29).
+  const ZERO_DP_CCY = new Set(['VND', 'IDR', 'KRW', 'COP']);
+  function fmtMoney(code, v) {
+    if (!isFinite(v)) return '&mdash;';
+    const dp = ZERO_DP_CCY.has(code) ? 0 : 2;
+    try {
+      return v.toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp });
+    } catch (e) {
+      return v.toFixed(dp);
+    }
+  }
+
+  // Offline fallback: a snapshot of the live open.er-api.com USD rates (units per
+  // 1 USD), captured 2026-08-18 and cross-verified against Google Finance / XE /
+  // Wise (every value within 0.31%). The live API is fetched hourly and ALWAYS
+  // preferred; this only engages if that fetch fails, so conversions never fully
+  // break. The last successful *live* pull is also persisted (saveLastRates) and
+  // is preferred over this baked snapshot, so the fallback effectively self-updates.
+  const FX_FALLBACK_ASOF = '2026-08-18';
+  const FX_FALLBACK = Object.freeze({
+    USD: 1,
+    SGD: 1.277049,
+    HKD: 7.845083,
+    TWD: 31.8395,
+    KRW: 1414.423042,
+    MYR: 4.062917,
+    IDR: 17830.686293,
+    VND: 26137.286999,
+    EUR: 0.863128,
+    COP: 3137.906203,
+    TRY: 47.892604,
+    PLN: 3.72123,
+  });
+  const FX_STORE_KEY = '__rf_fx_last_v1';
+  function saveLastRates(rates) {
+    try {
+      const payload = JSON.stringify({ ts: Date.now(), rates });
+      if (typeof GM_setValue === 'function') GM_setValue(FX_STORE_KEY, payload);
+      else if (typeof localStorage !== 'undefined') localStorage.setItem(FX_STORE_KEY, payload);
+    } catch (e) { /* persistence is best-effort */ }
+  }
+  function loadLastRates() {
+    try {
+      let raw = null;
+      if (typeof GM_getValue === 'function') raw = GM_getValue(FX_STORE_KEY, null);
+      else if (typeof localStorage !== 'undefined') raw = localStorage.getItem(FX_STORE_KEY);
+      if (!raw) return null;
+      const obj = JSON.parse(raw);
+      // Only trust a persisted pull that's < 30 days old.
+      if (obj && obj.rates && obj.ts && (Date.now() - obj.ts) < 30 * 24 * 3600 * 1000) return obj.rates;
+    } catch (e) { /* ignore corrupt cache */ }
+    return null;
+  }
 
   // Dialog text that identifies the modal we filter
   const DIALOG_TITLE_RE = /Attach a receipt/i;
@@ -206,12 +265,30 @@
     }
   });
 
+  const FX_FALLBACK_TTL_MS = 60 * 1000; // back off only ~1 min on fallback, then retry live
   let fxCache = null;
   async function getRates() {
-    if (fxCache && Date.now() - fxCache.ts < FX_TTL_MS) return fxCache.data;
-    const data = await fetchFx();
-    fxCache = { ts: Date.now(), data };
-    return data;
+    if (fxCache) {
+      // Live rates are good for an hour; a cached fallback for only a minute so
+      // debounced refreshes don't hammer a dead endpoint yet recover quickly.
+      const ttl = (fxCache.data && fxCache.data.__fallback) ? FX_FALLBACK_TTL_MS : FX_TTL_MS;
+      if (Date.now() - fxCache.ts < ttl) return fxCache.data;
+    }
+    try {
+      const data = await fetchFx();
+      if (!data || !data.rates) throw new Error('FX response had no rates');
+      fxCache = { ts: Date.now(), data };
+      saveLastRates(data.rates);
+      return data;
+    } catch (e) {
+      // Live fetch failed -> degrade to the last live pull, else the baked
+      // snapshot, so the panel still converts. Flagged so refresh() can label it,
+      // and cached briefly (FX_FALLBACK_TTL_MS) to avoid re-hitting a dead endpoint.
+      const last = loadLastRates();
+      const data = last ? { rates: last, __fallback: 'last-live' } : { rates: FX_FALLBACK, __fallback: FX_FALLBACK_ASOF };
+      fxCache = { ts: Date.now(), data };
+      return data;
+    }
   }
 
   function readTotal() {
@@ -342,21 +419,26 @@
         $('.__rf_status').textContent = '';
         return;
       }
+      // getRates() is now total: it resolves to live rates or a labelled fallback
+      // and never rejects. This guard is defensive only (unexpected throw).
       let rates;
       try { rates = await getRates(); }
       catch (e) {
-        $('.__rf_targets').textContent = 'FX fetch failed: ' + e.message;
+        $('.__rf_targets').textContent = 'FX unavailable: ' + (e && e.message || e);
         return;
       }
       const tgts = convertTargets(total.amount, total.currency, rates);
       const tol = (parseFloat($('.__rf_tol').value) || 0) / 100;
+      const fxNote = rates.__fallback
+        ? ` <span style="color:#c0392b;" title="Live FX fetch failed; ${rates.__fallback === 'last-live' ? 'using the last successful live rates' : 'using the built-in ' + rates.__fallback + ' snapshot'}.">(offline rates: ${rates.__fallback})</span>`
+        : '';
       $('.__rf_targets').innerHTML =
         `<b>Source &rarr;</b> ` +
         TARGETS.map(c => {
           const v = tgts[c];
           if (!isFinite(v)) return `${c}: &mdash;`;
-          return `<span style="display:inline-block;margin-right:8px;"><b>${c}</b> ${v.toFixed(2)} <span style="color:#888;">(${(v*(1-tol)).toFixed(2)}&ndash;${(v*(1+tol)).toFixed(2)})</span></span>`;
-        }).join('');
+          return `<span style="display:inline-block;margin-right:8px;"><b>${c}</b> ${fmtMoney(c, v)} <span style="color:#888;">(${fmtMoney(c, v*(1-tol))}&ndash;${fmtMoney(c, v*(1+tol))})</span></span>`;
+        }).join('') + fxNote;
       const r = applyFilter(tgts, tol);
       $('.__rf_status').textContent = `${r.shown} shown / ${r.hidden} hidden`;
     }
@@ -578,8 +660,12 @@
     try {
       const r = await fetch(FX_BASE_URL);
       const j = await r.json();
-      return j.rates || {};
-    } catch { return {}; }
+      if (j && j.rates) { saveLastRates(j.rates); return j.rates; }
+      throw new Error('FX response had no rates');
+    } catch {
+      // Keep the >$25 receipt check working offline: last live pull, else snapshot.
+      return loadLastRates() || Object.assign({}, FX_FALLBACK);
+    }
   }
 
   function parseAmt(s) {

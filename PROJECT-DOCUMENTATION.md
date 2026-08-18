@@ -7,7 +7,7 @@ A single-file Tampermonkey/Greasemonkey userscript that augments the Coupa expen
 This userscript runs on any `*.coupahost.com` page and injects a persistent top-right control panel plus a filter inside Coupa's "Attach a receipt" dialog. It is a personal productivity tool to speed up cleaning and submitting expense reports in a corporate Coupa tenant (BDP / Philadelphia Finance Systems). It performs the same authenticated API calls the Coupa web app makes (using the page's CSRF token and the user's existing session cookies), so it acts entirely as the logged-in user with no separate credentials.
 
 Core capabilities:
-- **Receipt-dialog filter** — in the "Attach a receipt" modal, converts the expense-line total into USD/EUR/COP/SGD/TRY/PLN using live FX rates and hides wallet receipts outside a ±X% tolerance window.
+- **Receipt-dialog filter** — in the "Attach a receipt" modal, converts the expense-line total into USD/SGD/HKD/TWD/KRW/MYR/IDR/VND/EUR/COP/TRY/PLN using live FX rates and hides wallet receipts outside a ±X% tolerance window. Large-denomination currencies (VND/IDR/KRW/COP) render with thousands separators and no decimals. Live rates come from open.er-api.com (hourly cache); if that fetch fails, the panel degrades to the last successful live pull and then to a built-in, cross-verified rate snapshot (labelled "offline rates") so conversions never fully break.
 - **Apply Account to All** — PATCHes every draft expense line whose account does not already match the configured account.
 - **Account selector** — type-ahead search against Coupa's own account autocomplete; selection stored in `localStorage`.
 - **Match Receipts** — pairs wallet receipts to draft lines using a tiered scoring heuristic (exact amount, ±1% same currency + merchant-token overlap, cross-currency ±12% USD-eq + token overlap) and POSTs `merge_receipt_to_expense_line`.
@@ -18,7 +18,7 @@ Core capabilities:
 
 ## Status
 
-**Working / actively maintained.** Evidence: steady semver progression from v0.3.1 (initial commit, Apr 2026) through v0.8.7 to **v0.9.0** (adds `new_currency` editing + the example-attendee column). Commit messages are descriptive and feature-scoped. The script includes an in-app help modal that matches the implemented behavior. No obvious dead/half-finished features.
+**Working / actively maintained.** Evidence: steady semver progression from v0.3.1 (initial commit, Apr 2026) through v0.9.0 to **v0.10.0** (adds SE-/E-Asia display currencies SGD/HKD/TWD/KRW/MYR/IDR/VND, currency-aware number formatting, and a live→last-live→baked-snapshot FX fallback with persistence). Commit messages are descriptive and feature-scoped. The script includes an in-app help modal that matches the implemented behavior. No obvious dead/half-finished features.
 
 ## Technical Requirements
 
@@ -33,7 +33,7 @@ Core capabilities:
 
 - **ExcelJS 4.4.0** (MIT license) — loaded at runtime from jsDelivr (version-pinned in `EXCELJS_URL`, line 63), not vendored. Loaded via `fetch` + `new Function(...)` eval, with a blob-`<script>` fallback if CSP blocks the eval path.
 - **open.er-api.com** ("Exchange Rate API" / open access tier) — runtime HTTP JSON, no SDK bundled.
-- Userscript-manager API: `GM_xmlhttpRequest` (granted) used for the cross-origin FX call.
+- Userscript-manager API: `GM_xmlhttpRequest` (granted) for the cross-origin FX call; `GM_setValue`/`GM_getValue` (granted) to persist the last successful live rate pull (falls back to `localStorage` if unavailable).
 - No npm/`package.json`, no lockfile, no other third-party code.
 
 ## Setup Instructions
@@ -64,7 +64,7 @@ On a **draft** expense report page:
 Single IIFE in one file, organized into sections:
 - **Config** (lines ~17–120): `DEFAULT_ACCOUNT`, `ALL_CATEGORIES` catalog, attendee type ids, palettes, localStorage keys.
 - **ExcelJS loader** (~122–166): lazy `fetch` + `new Function` eval with blob-script fallback.
-- **Helpers** (~176–230): amount parsing, FX fetch/cache (`getRates`, 1h TTL), `esc`/`escapeHtml` HTML-escapers.
+- **Helpers** (~176–290): amount parsing; `TARGETS` display-currency list; `fmtMoney` currency-aware formatter (`ZERO_DP_CCY` set); FX fetch/cache (`getRates`, 1h in-memory TTL) with the `FX_FALLBACK` snapshot + `saveLastRates`/`loadLastRates` persistence (30-day trust window); `esc`/`escapeHtml` HTML-escapers.
 - **Receipt-dialog filter** (~250–360): reads the expense-line total, converts across `TARGETS`, hides out-of-window wallet lines.
 - **Account apply** (~410–540): discovers the draft report, iterates lines, PATCHes accounts via Coupa endpoints using the page CSRF token + `credentials: 'include'`.
 - **xlsx export** (~550–960): builds the workbook with conditional formatting and helper sheets.
@@ -100,6 +100,7 @@ No automated tests, no test framework, no CI. Verification is manual against a l
 - No README in the repo; the only documentation is the in-script help modal (and now this file).
 - Tenant-coupled: the hardcoded account, account code, and category catalog must be edited for any other Coupa tenant; behavior assumes specific Coupa endpoint shapes that vary across tenants (the code already guards some of this, e.g. account search "may not be available").
 - ExcelJS is loaded from a CDN at runtime; offline use or a CDN outage breaks the xlsx features.
+- FX offline fallback covers only the 12 display currencies. If the live rate API is down *and* there's no persisted pull (&lt;30 days) *and* an expense line is in some other currency, the xlsx "problems" export can't compute its USD-eq and silently skips that line's "missing receipt &gt; $25" check (strictly better than the pre-0.10.0 behavior, which skipped all non-USD when offline). Online, the API returns ~160 currencies so this doesn't arise. Follow-up: emit an explicit `fx_unknown` flag instead of skipping.
 
 ## Third-party & Licensing notes
 

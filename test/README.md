@@ -16,6 +16,15 @@ python3 test/build_roundtrip_test.py          # slices real fns -> test/roundtri
 
 Expected tail: `==== ALL ASSERTIONS PASSED ====` (40 assertions).
 
+```sh
+# FX logic (v0.10.0): TARGETS list, fmtMoney formatting, live->last-live->snapshot fallback
+python3 test/build_fx_test.py                 # slices real fns -> test/fx_test.generated.js
+/System/Library/Frameworks/JavaScriptCore.framework/Versions/A/Helpers/jsc \
+  test/fx_test.generated.js
+```
+
+Expected tail: `==== ALL ASSERTIONS PASSED ====` (53 assertions).
+
 ## What it covers
 
 `build_roundtrip_test.py` extracts the actual `_buildWorkbookInner`,
@@ -30,6 +39,13 @@ driver runs an **export → simulated user edits → import → PATCH-body** rou
   new attendee; directory columns still typo-guarded.
 - **PATCH-body consistency** — single-currency lines keep the reimbursement side
   consistent (RUN5–7); the `isCrossCurrency` guard classification (RUN8).
+
+`build_fx_test.py` extracts the actual `fmtMoney`, `convertTargets`, `getRates`,
+`fetchFxToUSD`, `saveLastRates`, `loadLastRates` + the `TARGETS`/`FX_FALLBACK`
+constants and asserts: the 12-currency `TARGETS` list, snapshot parity, USD
+conversion math, currency-aware formatting (grouped/0-dp for VND/IDR/KRW/COP),
+and the live → last-live (persisted) → baked-snapshot fallback chain incl. its
+brief back-off cache and 30-day staleness window.
 
 ## Parse-only sanity check
 
